@@ -12,11 +12,11 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -59,6 +59,18 @@ fn default_true() -> bool {
     true
 }
 
+/// Per-session RESUME state captured from the READY event.
+///
+/// When the gateway disconnects, we try RESUME first (preserving Discord's
+/// view of our session — the same `session_id`, dedup window, and presence)
+/// before falling back to a cold IDENTIFY. This keeps the "idle for hours,
+/// come back, keep talking" UX intact across transient network blips.
+#[derive(Debug, Clone)]
+struct ResumeState {
+    session_id: String,
+    resume_gateway_url: String,
+}
+
 // ---------------------------------------------------------------------------
 // DiscordPlatform
 // ---------------------------------------------------------------------------
@@ -78,6 +90,13 @@ pub struct DiscordPlatform {
     self_ref: std::sync::Mutex<Option<std::sync::Weak<dyn PlatformCapabilities>>>,
     /// Outgoing rate limiter (5 msg/sec per channel for Discord).
     outgoing_limiter: crate::outgoing_ratelimit::OutgoingRateLimiter,
+    /// Captured from READY, cleared on INVALID_SESSION. Shared across reconnects
+    /// so the next connection attempt can RESUME instead of starting fresh.
+    resume_state: Arc<Mutex<Option<ResumeState>>>,
+    /// Latest gateway sequence number. -1 means no dispatch event seen yet.
+    /// Shared with heartbeat_loop so heartbeats carry the current seq, and
+    /// with the RESUME path which needs the last seq Discord saw us ack.
+    last_sequence: Arc<AtomicI64>,
 }
 
 impl DiscordPlatform {
@@ -101,6 +120,8 @@ impl DiscordPlatform {
             group_reply_all: opts.group_reply_all,
             self_ref: std::sync::Mutex::new(None),
             outgoing_limiter: crate::outgoing_ratelimit::OutgoingRateLimiter::new(),
+            resume_state: Arc::new(Mutex::new(None)),
+            last_sequence: Arc::new(AtomicI64::new(-1)),
         }
     }
 
@@ -173,6 +194,33 @@ async fn api_request_with(
     }
 }
 
+/// Cap backoff at 30s — the QQBot pattern — so we don't go silent for
+/// minutes after a long outage.
+const MAX_BACKOFF_SECS: u64 = 30;
+
+fn next_backoff(current: u64) -> u64 {
+    (current * 2).min(MAX_BACKOFF_SECS)
+}
+
+/// Sleep for `secs` seconds ± up to 20% jitter, so many bots reconnecting
+/// after a shared Discord blip don't align on the same tick. No extra
+/// dependency: seeds jitter from the current monotonic nanos.
+async fn sleep_with_jitter(secs: u64) {
+    let base_ms = secs.saturating_mul(1000);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter_range = base_ms / 5; // ±20%
+    let offset = if jitter_range > 0 {
+        (nanos % (jitter_range * 2)) as i64 - jitter_range as i64
+    } else {
+        0
+    };
+    let total_ms = (base_ms as i64 + offset).max(0) as u64;
+    tokio::time::sleep(Duration::from_millis(total_ms)).await;
+}
+
 /// Get the Gateway WebSocket URL from Discord.
 async fn get_gateway_url(client: &reqwest::Client, token: &str) -> Result<String> {
     let url = format!("{}/gateway/bot", DISCORD_API_BASE);
@@ -210,6 +258,8 @@ impl Platform for DiscordPlatform {
         let client = self.client.clone();
         let thread_isolation = self.thread_isolation;
         let group_reply_all = self.group_reply_all;
+        let resume_state = self.resume_state.clone();
+        let last_sequence = self.last_sequence.clone();
 
         // Upgrade the weak self-reference so the gateway loop can pass
         // Arc<dyn PlatformCapabilities> into every handler call.
@@ -225,38 +275,47 @@ impl Platform for DiscordPlatform {
             let mut backoff_secs = 1u64;
 
             while running.load(Ordering::Relaxed) {
-                // Get gateway URL
-                let gateway_url = match get_gateway_url(&client, &token).await {
-                    Ok(url) => url,
-                    Err(e) => {
-                        tracing::error!(error = %e, backoff = backoff_secs, "discord: failed to get gateway URL, retrying");
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                        continue;
+                // Prefer resume_gateway_url when we have prior session state.
+                // Falls back to GET /gateway/bot on cold start or after an
+                // INVALID_SESSION cleared the resume state.
+                let (gateway_url, is_resume) = {
+                    let rs = resume_state.lock().await;
+                    match rs.as_ref() {
+                        Some(state) => (
+                            format!("{}/?v=10&encoding=json", state.resume_gateway_url),
+                            true,
+                        ),
+                        None => match get_gateway_url(&client, &token).await {
+                            Ok(url) => (url, false),
+                            Err(e) => {
+                                tracing::error!(error = %e, backoff = backoff_secs, "discord: failed to get gateway URL, retrying");
+                                sleep_with_jitter(backoff_secs).await;
+                                backoff_secs = next_backoff(backoff_secs);
+                                continue;
+                            }
+                        },
                     }
                 };
 
-                tracing::info!("discord: connecting to gateway {}", gateway_url);
+                tracing::info!(is_resume, "discord: connecting to gateway {}", gateway_url);
 
                 let ws_result = connect_async(&gateway_url).await;
                 let (ws_stream, _) = match ws_result {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(error = %e, backoff = backoff_secs, "discord: gateway connect failed, retrying");
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
+                        sleep_with_jitter(backoff_secs).await;
+                        backoff_secs = next_backoff(backoff_secs);
                         continue;
                     }
                 };
 
-                // Reset backoff on successful connect
-                backoff_secs = 1;
                 tracing::info!("discord: gateway connected");
 
                 let (ws_sink, ws_read) = ws_stream.split();
                 let ws_sink = Arc::new(Mutex::new(ws_sink));
 
-                gateway_event_loop(
+                let reached_ready = gateway_event_loop(
                     ws_read,
                     ws_sink,
                     running.clone(),
@@ -269,13 +328,23 @@ impl Platform for DiscordPlatform {
                     handler.clone(),
                     client.clone(),
                     self_weak.clone(),
+                    resume_state.clone(),
+                    last_sequence.clone(),
                 )
                 .await;
 
+                // Only reset backoff when this connection actually lived —
+                // reached READY (fresh session) or RESUMED (resumed session).
+                // If we never got past Hello, keep backing off so a Discord
+                // outage doesn't turn into a tight reconnect loop.
+                if reached_ready {
+                    backoff_secs = 1;
+                }
+
                 if running.load(Ordering::Relaxed) {
                     tracing::warn!(backoff = backoff_secs, "discord: gateway disconnected, reconnecting");
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(60);
+                    sleep_with_jitter(backoff_secs).await;
+                    backoff_secs = next_backoff(backoff_secs);
                 }
             }
         });
@@ -727,6 +796,11 @@ pub fn create(config: &serde_json::Value) -> Result<Arc<dyn PlatformCapabilities
 // ---------------------------------------------------------------------------
 
 /// Main Gateway event loop. Runs until the connection drops or `running` is cleared.
+///
+/// Returns `true` if this connection reached READY before dropping. The outer
+/// reconnect loop uses that signal to distinguish "clean disconnect of a live
+/// session" (safe to reset backoff) from "never fully connected" (keep
+/// backoff climbing).
 #[allow(clippy::too_many_arguments)]
 async fn gateway_event_loop(
     mut ws_read: WsStream,
@@ -741,12 +815,23 @@ async fn gateway_event_loop(
     handler: MessageHandler,
     client: reqwest::Client,
     self_weak: std::sync::Weak<dyn PlatformCapabilities>,
-) {
-    let mut sequence: Option<u64> = None;
+    resume_state: Arc<Mutex<Option<ResumeState>>>,
+    last_sequence: Arc<AtomicI64>,
+) -> bool {
+    let mut reached_ready = false;
     let mut heartbeat_handle: Option<tokio::task::JoinHandle<()>> = None;
     let seen_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let seen_timestamps: Arc<Mutex<Vec<(String, Instant)>>> =
         Arc::new(Mutex::new(Vec::new()));
+
+    // Heartbeat ACK watchdog. The heartbeat task sets `ack_pending` before
+    // sending; the dispatch loop clears it on opcode 11. If the heartbeat
+    // task finds the flag still set next tick, Discord has gone silent on
+    // our keepalives and we bail out of this loop so the outer reconnect
+    // can RESUME. `dead_notify` lets the heartbeat task pop us out of the
+    // select immediately instead of waiting 120s.
+    let ack_pending = Arc::new(AtomicBool::new(false));
+    let dead_notify = Arc::new(Notify::new());
 
     // Liveness accounting: without a periodic heartbeat log, a healthy idle
     // connection is indistinguishable from a wedged one — both produce zero
@@ -761,6 +846,10 @@ async fn gateway_event_loop(
     while running.load(Ordering::Relaxed) {
         let msg = tokio::select! {
             msg = ws_read.next() => msg,
+            _ = dead_notify.notified() => {
+                tracing::warn!("discord: heartbeat watchdog fired, closing gateway");
+                break;
+            }
             _ = tokio::time::sleep(Duration::from_secs(120)) => {
                 tracing::warn!("discord: gateway read timeout");
                 break;
@@ -796,9 +885,10 @@ async fn gateway_event_loop(
             }
         };
 
-        // Update sequence number
+        // Update sequence number (shared with heartbeat task + outer reconnect
+        // for the RESUME payload).
         if let Some(s) = payload["s"].as_u64() {
-            sequence = Some(s);
+            last_sequence.store(s as i64, Ordering::Release);
         }
 
         let opcode = payload["op"].as_u64().unwrap_or(0);
@@ -814,6 +904,7 @@ async fn gateway_event_loop(
 
                 match event_name {
                     "READY" => {
+                        reached_ready = true;
                         if let Some(user_id) = data["user"]["id"].as_str() {
                             let mut uid = bot_user_id.lock().await;
                             *uid = Some(user_id.to_string());
@@ -822,6 +913,25 @@ async fn gateway_event_loop(
                             // Slash commands are now registered by the engine
                             // via register_commands() after skills are discovered.
                         }
+                        // Capture RESUME state. Discord returns resume_gateway_url
+                        // pointing at the specific edge that holds our session;
+                        // using it (instead of the generic /gateway/bot URL) is
+                        // what lets RESUME actually succeed.
+                        if let (Some(sid), Some(rurl)) = (
+                            data["session_id"].as_str(),
+                            data["resume_gateway_url"].as_str(),
+                        ) {
+                            let mut rs = resume_state.lock().await;
+                            *rs = Some(ResumeState {
+                                session_id: sid.to_string(),
+                                resume_gateway_url: rurl.to_string(),
+                            });
+                            tracing::info!("discord: RESUME state captured");
+                        }
+                    }
+                    "RESUMED" => {
+                        reached_ready = true;
+                        tracing::info!("discord: session resumed successfully");
                     }
                     "MESSAGE_CREATE" => {
                         // Dedup: skip messages we have already seen.
@@ -902,50 +1012,80 @@ async fn gateway_event_loop(
                     _ => {}
                 }
             }
-            // Hello (opcode 10) -- send Identify and start heartbeat.
+            // Hello (opcode 10) -- send RESUME if we have state, else IDENTIFY,
+            // then start the heartbeat task.
             10 => {
                 let heartbeat_interval =
                     payload["d"]["heartbeat_interval"].as_u64().unwrap_or(41250);
 
                 tracing::info!(interval_ms = heartbeat_interval, "discord: received Hello");
 
-                let identify = serde_json::json!({
-                    "op": 2,
-                    "d": {
-                        "token": token,
-                        "intents": GATEWAY_INTENTS,
-                        "properties": {
-                            "os": "linux",
-                            "browser": "agentbridge",
-                            "device": "agentbridge"
-                        }
+                let resume_payload = {
+                    let rs = resume_state.lock().await;
+                    rs.as_ref().map(|state| {
+                        let seq = last_sequence.load(Ordering::Acquire);
+                        serde_json::json!({
+                            "op": 6,
+                            "d": {
+                                "token": token,
+                                "session_id": state.session_id,
+                                "seq": seq,
+                            }
+                        })
+                    })
+                };
+
+                let outgoing = match resume_payload {
+                    Some(p) => {
+                        tracing::info!("discord: sending RESUME");
+                        p
                     }
-                });
+                    None => {
+                        tracing::info!("discord: sending IDENTIFY");
+                        serde_json::json!({
+                            "op": 2,
+                            "d": {
+                                "token": token,
+                                "intents": GATEWAY_INTENTS,
+                                "properties": {
+                                    "os": "linux",
+                                    "browser": "agentbridge",
+                                    "device": "agentbridge"
+                                }
+                            }
+                        })
+                    }
+                };
 
                 {
                     let mut sink = ws_sink.lock().await;
-                    if let Err(e) = sink.send(WsMessage::Text(identify.to_string())).await {
-                        tracing::error!(error = %e, "discord: failed to send Identify");
+                    if let Err(e) = sink.send(WsMessage::Text(outgoing.to_string())).await {
+                        tracing::error!(error = %e, "discord: failed to send IDENTIFY/RESUME");
                         break;
                     }
                 }
 
-                // Spawn heartbeat task
+                // Spawn heartbeat task, handing it the shared ACK watchdog
+                // + the live sequence atomic. The old design passed a static
+                // snapshot of `sequence` — under RESUME that means Discord
+                // would replay from seq=None, losing any missed events.
                 if let Some(h) = heartbeat_handle.take() {
                     h.abort();
                 }
-                let sink_clone = ws_sink.clone();
-                let running_clone = running.clone();
-                let seq_ref = sequence;
                 heartbeat_handle = Some(tokio::spawn(heartbeat_loop(
-                    sink_clone,
-                    running_clone,
+                    ws_sink.clone(),
+                    running.clone(),
                     heartbeat_interval,
-                    seq_ref,
+                    last_sequence.clone(),
+                    ack_pending.clone(),
+                    dead_notify.clone(),
                 )));
             }
-            // Heartbeat ACK (opcode 11)
+            // Heartbeat ACK (opcode 11) — clear the watchdog flag AND, if the
+            // idle-liveness window elapsed, log one line so long quiet periods
+            // produce evidence of liveness.
             11 => {
+                ack_pending.store(false, Ordering::Release);
                 ack_count_since_log += 1;
                 let now = Instant::now();
                 if now.duration_since(last_liveness_log) >= LIVENESS_LOG_INTERVAL {
@@ -959,17 +1099,33 @@ async fn gateway_event_loop(
                     ack_count_since_log = 0;
                 }
             }
-            // Reconnect (opcode 7) or Invalid Session (opcode 9)
-            7 | 9 => {
-                tracing::warn!(opcode, "discord: server requested reconnect/invalid session");
+            // Reconnect (opcode 7): keep RESUME state so we come back to the
+            // same session. Invalid Session (opcode 9): Discord has dropped
+            // our session — must clear state so the reconnect loop falls
+            // back to a fresh IDENTIFY.
+            7 => {
+                tracing::warn!("discord: server requested reconnect (op 7)");
                 break;
             }
-            // Heartbeat request (opcode 1)
+            9 => {
+                let resumable = payload["d"].as_bool().unwrap_or(false);
+                tracing::warn!(resumable, "discord: INVALID_SESSION");
+                if !resumable {
+                    let mut rs = resume_state.lock().await;
+                    *rs = None;
+                    last_sequence.store(-1, Ordering::Release);
+                }
+                break;
+            }
+            // Heartbeat request (opcode 1) — ad-hoc heartbeat on server demand.
             1 => {
-                let heartbeat = serde_json::json!({
-                    "op": 1,
-                    "d": sequence
-                });
+                let seq = last_sequence.load(Ordering::Acquire);
+                let d = if seq >= 0 {
+                    serde_json::Value::from(seq)
+                } else {
+                    serde_json::Value::Null
+                };
+                let heartbeat = serde_json::json!({"op": 1, "d": d});
                 let mut sink = ws_sink.lock().await;
                 let _ = sink.send(WsMessage::Text(heartbeat.to_string())).await;
             }
@@ -981,7 +1137,8 @@ async fn gateway_event_loop(
     if let Some(h) = heartbeat_handle.take() {
         h.abort();
     }
-    tracing::info!("discord: gateway event loop ended");
+    tracing::info!(reached_ready, "discord: gateway event loop ended");
+    reached_ready
 }
 
 // ---------------------------------------------------------------------------
@@ -992,11 +1149,13 @@ async fn heartbeat_loop(
     ws_sink: Arc<Mutex<WsSink>>,
     running: Arc<AtomicBool>,
     interval_ms: u64,
-    sequence: Option<u64>,
+    last_sequence: Arc<AtomicI64>,
+    ack_pending: Arc<AtomicBool>,
+    dead_notify: Arc<Notify>,
 ) {
     let interval = Duration::from_millis(interval_ms);
 
-    // Jitter the first heartbeat.
+    // Jitter the first heartbeat per Discord's recommendation.
     let jitter = Duration::from_millis(interval_ms / 2);
     tokio::time::sleep(jitter).await;
 
@@ -1005,15 +1164,30 @@ async fn heartbeat_loop(
             break;
         }
 
-        let heartbeat = serde_json::json!({
-            "op": 1,
-            "d": sequence
-        });
+        // ACK watchdog (QQBot pattern): if the previous heartbeat's ACK
+        // never cleared this flag, the gateway has gone silent on us even
+        // though the TCP socket is still up. Bail out so the outer loop
+        // can reconnect — RESUME preserves session state.
+        if ack_pending.load(Ordering::Acquire) {
+            tracing::warn!("discord: heartbeat ACK missed, declaring connection dead");
+            dead_notify.notify_one();
+            break;
+        }
 
+        let seq = last_sequence.load(Ordering::Acquire);
+        let d = if seq >= 0 {
+            serde_json::Value::from(seq)
+        } else {
+            serde_json::Value::Null
+        };
+        let heartbeat = serde_json::json!({"op": 1, "d": d});
+
+        ack_pending.store(true, Ordering::Release);
         {
             let mut sink = ws_sink.lock().await;
             if let Err(e) = sink.send(WsMessage::Text(heartbeat.to_string())).await {
                 tracing::error!(error = %e, "discord: heartbeat send failed");
+                dead_notify.notify_one();
                 break;
             }
         }
