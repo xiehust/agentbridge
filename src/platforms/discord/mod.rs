@@ -748,6 +748,16 @@ async fn gateway_event_loop(
     let seen_timestamps: Arc<Mutex<Vec<(String, Instant)>>> =
         Arc::new(Mutex::new(Vec::new()));
 
+    // Liveness accounting: without a periodic heartbeat log, a healthy idle
+    // connection is indistinguishable from a wedged one — both produce zero
+    // logs. Emit one line per LIVENESS_LOG_INTERVAL so long-idle sessions
+    // still show evidence of liveness.
+    let loop_started = Instant::now();
+    let mut last_event_at = loop_started;
+    let mut last_liveness_log = loop_started;
+    let mut ack_count_since_log: u64 = 0;
+    const LIVENESS_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
     while running.load(Ordering::Relaxed) {
         let msg = tokio::select! {
             msg = ws_read.next() => msg,
@@ -796,6 +806,7 @@ async fn gateway_event_loop(
         match opcode {
             // Dispatch (opcode 0)
             0 => {
+                last_event_at = Instant::now();
                 let event_name = payload["t"].as_str().unwrap_or("");
                 let data = &payload["d"];
 
@@ -819,6 +830,7 @@ async fn gateway_event_loop(
                             {
                                 let mut seen = seen_ids.lock().await;
                                 if seen.contains(msg_id) {
+                                    tracing::debug!(msg_id, "discord: dedup hit, skipping");
                                     continue;
                                 }
                                 seen.insert(msg_id.to_string());
@@ -933,7 +945,20 @@ async fn gateway_event_loop(
                 )));
             }
             // Heartbeat ACK (opcode 11)
-            11 => {}
+            11 => {
+                ack_count_since_log += 1;
+                let now = Instant::now();
+                if now.duration_since(last_liveness_log) >= LIVENESS_LOG_INTERVAL {
+                    let idle_secs = now.duration_since(last_event_at).as_secs();
+                    tracing::info!(
+                        acks = ack_count_since_log,
+                        idle_secs,
+                        "discord: gateway alive (no dispatch events)"
+                    );
+                    last_liveness_log = now;
+                    ack_count_since_log = 0;
+                }
+            }
             // Reconnect (opcode 7) or Invalid Session (opcode 9)
             7 | 9 => {
                 tracing::warn!(opcode, "discord: server requested reconnect/invalid session");
@@ -1022,17 +1047,22 @@ fn parse_message_create(
     }
 
     let author_id = data["author"]["id"].as_str()?;
+    let message_id = data["id"].as_str()?.to_string();
 
     // Access control.
     if let Some(ref allowed) = allow_from {
         if !allowed.contains(author_id) {
+            tracing::warn!(
+                msg_id = %message_id,
+                from = author_id,
+                "discord: ACL rejected message"
+            );
             return None;
         }
     }
 
     let content = data["content"].as_str().unwrap_or("").to_string();
     let channel_id = data["channel_id"].as_str()?.to_string();
-    let message_id = data["id"].as_str()?.to_string();
     let guild_id = data["guild_id"].as_str();
 
     let is_dm = guild_id.is_none();
@@ -1061,6 +1091,7 @@ fn parse_message_create(
     }
 
     if content.is_empty() {
+        tracing::debug!(msg_id = %message_id, "discord: empty content, skipping");
         return None;
     }
 
@@ -1076,6 +1107,7 @@ fn parse_message_create(
     };
 
     if clean_content.is_empty() {
+        tracing::debug!(msg_id = %message_id, "discord: content empty after mention strip, skipping");
         return None;
     }
 

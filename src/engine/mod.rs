@@ -442,7 +442,7 @@ async fn handle_message(
 
     // 2. Access control
     if !is_allowed(&config.allow_from, &msg.from) {
-        tracing::debug!(from = %msg.from, "access denied");
+        tracing::warn!(id = %msg.id, from = %msg.from, platform = platform.name(), "access denied");
         return Ok(());
     }
 

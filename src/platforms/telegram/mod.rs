@@ -511,10 +511,16 @@ async fn parse_incoming_message(
     let message = update.get("message").or_else(|| update.get("edited_message"))?;
 
     let from_id = message["from"]["id"].as_i64().unwrap_or(0).to_string();
+    let msg_id = message["message_id"].as_i64().unwrap_or(0);
 
     // ACL check.
     if let Some(ref allowed) = allow_from {
         if !allowed.contains(&from_id) {
+            tracing::warn!(
+                msg_id,
+                from = %from_id,
+                "telegram: ACL rejected message"
+            );
             return None;
         }
     }
