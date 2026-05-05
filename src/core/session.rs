@@ -259,12 +259,25 @@ impl SessionManager {
     /// The work_dir is encoded the same way Claude Code encodes project paths
     /// (e.g. `/home/ubuntu/agentbridge` → `-home-ubuntu-agentbridge`), ensuring
     /// each work directory gets its own isolated session storage.
+    ///
+    /// `work_dir` is canonicalized first so that equivalent paths (relative,
+    /// symlinked, trailing slash) always map to the same on-disk state file.
+    /// If canonicalization fails (e.g. the directory does not yet exist) we
+    /// fall back to the raw path — this preserves backwards-compatibility with
+    /// previously-written `state.json` locations.
     pub fn new(base_dir: &Path, work_dir: &Path) -> Self {
-        let encoded = work_dir
-            .to_string_lossy()
-            .replace('/', "-");
+        let resolved = work_dir
+            .canonicalize()
+            .unwrap_or_else(|_| work_dir.to_path_buf());
+        let encoded = resolved.to_string_lossy().replace('/', "-");
         let data_dir = base_dir.join("sessions").join(&encoded);
         fs::create_dir_all(&data_dir).ok();
+
+        tracing::debug!(
+            work_dir = %resolved.display(),
+            state_file = %data_dir.join("state.json").display(),
+            "session manager initialized",
+        );
 
         let mut mgr = Self {
             data_dir,
@@ -328,6 +341,25 @@ impl SessionManager {
 
         self.persist();
         session
+    }
+
+    /// List every `(session_key, currently-active session)` pair.
+    ///
+    /// Unlike [`list_all`] this only returns the session each key is
+    /// currently pointing at (via `active_keys`), so callers can restore
+    /// per-key state (e.g. last-used agent) after a restart without
+    /// accidentally resurrecting historical sessions.
+    pub fn active_sessions(&self) -> Vec<(String, Arc<Session>)> {
+        let active = self.active_keys.lock().unwrap();
+        let sessions = self.sessions.lock().unwrap();
+        active
+            .iter()
+            .filter_map(|(key, session_id)| {
+                sessions
+                    .get(session_id)
+                    .map(|s| (key.clone(), Arc::clone(s)))
+            })
+            .collect()
     }
 
     /// List every (session_key, session) pair. Used for cross-platform
@@ -957,5 +989,46 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent_type, "");
         assert_eq!(sessions[0].effective_agent_type(), "claude");
+    }
+
+    // -- active_sessions + work_dir canonicalization --
+
+    #[test]
+    fn active_sessions_returns_only_current_sessions_per_key() {
+        let (mgr, _tmp) = make_manager();
+        mgr.new_session_with_agent("user:alice", Some("first".into()), "claude");
+        // Second new_session_with_agent replaces the active pointer for alice.
+        let latest = mgr.new_session_with_agent("user:alice", Some("second".into()), "kiro");
+        mgr.new_session_with_agent("user:bob", Some("bob-s".into()), "claude");
+
+        let mut active = mgr.active_sessions();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].0, "user:alice");
+        assert_eq!(active[0].1.id, latest.id);
+        assert_eq!(active[0].1.agent_type, "kiro");
+        assert_eq!(active[1].0, "user:bob");
+    }
+
+    #[test]
+    fn session_manager_reloads_after_canonicalization() {
+        // Even if the caller passes a trailing slash / double slash / ".",
+        // the state file should be shared because canonicalize normalizes it.
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("project");
+        fs::create_dir_all(&real_dir).unwrap();
+
+        let session_id;
+        {
+            let mgr = SessionManager::new(tmp.path(), &real_dir);
+            let s = mgr.new_session_with_agent("user:alice", Some("s".into()), "claude");
+            session_id = s.id.clone();
+        }
+
+        // Reopen with a non-canonical variant (trailing "/./").
+        let alt = real_dir.join(".");
+        let mgr2 = SessionManager::new(tmp.path(), &alt);
+        let active = mgr2.get_or_create("user:alice");
+        assert_eq!(active.id, session_id);
     }
 }

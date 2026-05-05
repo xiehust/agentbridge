@@ -145,13 +145,43 @@ impl Engine {
             tracing::info!(count = skill_count, "skills discovered");
         }
 
+        // Rehydrate per-key active agent selections from the persisted session
+        // store so that a restart does not silently snap every user back to the
+        // project default. We only trust sessions that still carry a non-empty
+        // `agent_type` (and only those still referenced by `active_keys`),
+        // otherwise we fall back to the config default on first message.
+        let known_agents: std::collections::HashSet<String> = config
+            .resolved_agents()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        let mut hydrated: HashMap<String, String> = HashMap::new();
+        for (key, session) in sessions.active_sessions() {
+            let agent_type = session.agent_type.trim();
+            if agent_type.is_empty() {
+                continue;
+            }
+            if !known_agents.is_empty() && !known_agents.contains(agent_type) {
+                tracing::debug!(
+                    key = %key,
+                    agent = %agent_type,
+                    "skipping hydrated agent — not in current config",
+                );
+                continue;
+            }
+            hydrated.insert(key, agent_type.to_string());
+        }
+        if !hydrated.is_empty() {
+            tracing::info!(count = hydrated.len(), "restored active agent selections");
+        }
+
         Self {
             config,
             app_config,
             platforms: Vec::new(),
             sessions,
             interactive_states: Arc::new(Mutex::new(HashMap::new())),
-            active_agents: Arc::new(Mutex::new(HashMap::new())),
+            active_agents: Arc::new(Mutex::new(hydrated)),
             dedup: Arc::new(DedupTracker::new()),
             rate_limiter,
             model_override: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2167,5 +2197,92 @@ projects:
         }
         let name = resolve_active_agent(&active, "telegram:u", &config).await;
         assert_eq!(name, "kiro");
+    }
+
+    /// Regression: after a restart the engine must rehydrate `active_agents`
+    /// from persisted sessions, so users who had previously `/agent kiro`ed
+    /// do not silently snap back to the project default.
+    #[tokio::test]
+    async fn engine_new_hydrates_active_agents_from_sessions() {
+        use crate::config::AppConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        // First boot: create a "kiro" session for alice and a "claude" one for bob.
+        {
+            let sm = SessionManager::new(tmp.path(), &work);
+            sm.new_session_with_agent("discord:alice", None, "kiro");
+            sm.new_session_with_agent("discord:bob", None, "claude");
+        }
+
+        // Build a ProjectConfig whose default_agent is "claude" (not kiro),
+        // so the fallback would *wrongly* send alice to claude if we didn't hydrate.
+        let yaml = format!(
+            r#"
+data_dir: {}
+projects:
+  - name: test-proj
+    work_dir: {}
+    agents:
+      - name: claude
+        backend: claude
+      - name: kiro
+        backend: acp
+        acp:
+          command: echo
+          args: []
+    default_agent: claude
+    platforms: []
+"#,
+            tmp.path().display(),
+            work.display(),
+        );
+        let mut app: AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        let project = app.projects.remove(0);
+
+        let engine = Engine::new(project, app);
+        let map = engine.active_agents.lock().await;
+        assert_eq!(map.get("discord:alice").map(String::as_str), Some("kiro"));
+        assert_eq!(map.get("discord:bob").map(String::as_str), Some("claude"));
+    }
+
+    /// If a persisted session references an agent that no longer exists in
+    /// the current config, we must *not* hydrate it (stale config drift) —
+    /// `resolve_active_agent` would otherwise try to spawn a missing backend.
+    #[tokio::test]
+    async fn engine_new_skips_unknown_agents_when_hydrating() {
+        use crate::config::AppConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        {
+            let sm = SessionManager::new(tmp.path(), &work);
+            sm.new_session_with_agent("discord:alice", None, "long-gone-agent");
+        }
+
+        let yaml = format!(
+            r#"
+data_dir: {}
+projects:
+  - name: test-proj
+    work_dir: {}
+    agents:
+      - name: claude
+        backend: claude
+    default_agent: claude
+    platforms: []
+"#,
+            tmp.path().display(),
+            work.display(),
+        );
+        let mut app: AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        let project = app.projects.remove(0);
+        let engine = Engine::new(project, app);
+        let map = engine.active_agents.lock().await;
+        assert!(map.get("discord:alice").is_none());
     }
 }
