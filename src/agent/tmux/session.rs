@@ -25,9 +25,11 @@ use super::super::{AgentSession, PermissionResponder};
 pub struct TmuxSession {
     session_name: String,
     events_rx: mpsc::Receiver<AgentEvent>,
-    event_tx: mpsc::Sender<AgentEvent>,
     alive: Arc<AtomicBool>,
     last_output: Arc<Mutex<Vec<String>>>,
+    // The only live sender lives inside the poll task. Keeping a clone here
+    // would hold the channel open forever, so the engine could never observe
+    // `recv() -> None` when the poll task exits on a dead session.
     _poll_handle: JoinHandle<()>,
 }
 
@@ -55,8 +57,7 @@ impl AgentSession for TmuxSession {
         if !self.alive.load(Ordering::Relaxed) {
             return Err(anyhow!("tmux: session not alive"));
         }
-        let key = if allow { "y" } else { "n" };
-        tmux_send_raw_keys(&self.session_name, key).await?;
+        tmux_send_permission(&self.session_name, allow).await?;
         Ok(())
     }
 
@@ -122,8 +123,7 @@ impl PermissionResponder for TmuxPermissionResponder {
         if !self.alive.load(Ordering::Relaxed) {
             return Err(anyhow!("tmux: session not alive"));
         }
-        let key = if allow { "y" } else { "n" };
-        tmux_send_raw_keys(&self.session_name, key).await?;
+        tmux_send_permission(&self.session_name, allow).await?;
         Ok(())
     }
 }
@@ -201,19 +201,28 @@ impl TmuxAgent {
         let last_output: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(128);
 
-        // Spawn background polling task.
+        // Spawn background polling task. The task owns the only sender clone so
+        // the channel closes (recv -> None) when the task exits on a dead session.
         let poll_session = session_name.clone();
+        let poll_work_dir = self.work_dir.display().to_string();
+        let poll_auto_restart = self.tmux_config.auto_restart;
         let poll_alive = Arc::clone(&alive);
         let poll_last_output = Arc::clone(&last_output);
-        let poll_tx = event_tx.clone();
         let poll_handle = tokio::spawn(async move {
-            poll_loop(poll_session, poll_alive, poll_last_output, poll_tx).await;
+            poll_loop(
+                poll_session,
+                poll_work_dir,
+                poll_auto_restart,
+                poll_alive,
+                poll_last_output,
+                event_tx,
+            )
+            .await;
         });
 
         Ok(TmuxSession {
             session_name: session_name.clone(),
             events_rx: event_rx,
-            event_tx,
             alive,
             last_output,
             _poll_handle: poll_handle,
@@ -229,13 +238,29 @@ impl TmuxAgent {
 /// and emits AgentEvent for new lines.
 async fn poll_loop(
     session_name: String,
+    work_dir: String,
+    auto_restart: bool,
     alive: Arc<AtomicBool>,
     last_output: Arc<Mutex<Vec<String>>>,
     tx: mpsc::Sender<AgentEvent>,
 ) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));
-    // Track whether we have detected a "waiting for input" state after content.
+    let poll_period = std::time::Duration::from_millis(150);
+    let mut interval = tokio::time::interval(poll_period);
+
+    // Turn-completion is detected by output quiescence rather than by trying to
+    // recognise Claude Code's boxed input prompt: its last captured line is the
+    // box bottom border (`╰─...╯`), never a bare `>`, so a trailing-char check
+    // never fires and every turn would hang until the engine's idle timeout.
+    // Instead: once a turn has produced output (`had_content`), if no new line
+    // appears for QUIESCENCE_TICKS consecutive polls (~1500ms), treat the turn
+    // as finished.
+    const QUIESCENCE_TICKS: u32 = 10;
     let mut had_content = false;
+    let mut quiet_ticks: u32 = 0;
+
+    // auto_restart is bounded to a single attempt to avoid a tight crash-loop if
+    // claude refuses to start; after that we surface the error and exit.
+    let mut restart_used = false;
 
     loop {
         interval.tick().await;
@@ -246,6 +271,35 @@ async fn poll_loop(
 
         // Check session still exists.
         if !tmux_has_session(&session_name).await {
+            if auto_restart && !restart_used {
+                restart_used = true;
+                tracing::warn!(
+                    session = %session_name,
+                    "tmux: session disappeared, attempting auto_restart"
+                );
+                match restart_session(&session_name, &work_dir).await {
+                    Ok(()) => {
+                        // Resync the diff baseline so the freshly redrawn screen
+                        // is not replayed as a flood of "new" output.
+                        *last_output.lock().await = Vec::new();
+                        had_content = false;
+                        quiet_ticks = 0;
+                        continue;
+                    }
+                    Err(e) => {
+                        alive.store(false, Ordering::Release);
+                        let _ = tx
+                            .send(AgentEvent::Error {
+                                message: format!(
+                                    "tmux: auto_restart of '{}' failed: {}",
+                                    session_name, e
+                                ),
+                            })
+                            .await;
+                        break;
+                    }
+                }
+            }
             alive.store(false, Ordering::Release);
             let _ = tx
                 .send(AgentEvent::Error {
@@ -264,49 +318,77 @@ async fn poll_loop(
             }
         };
 
-        // Diff against last known output.
-        let mut prev = last_output.lock().await;
-        let new_lines = diff_lines(&prev, &current_lines);
+        // Diff against last known output, then drop the lock before any await:
+        // holding the mutex across `tx.send().await` would needlessly serialise
+        // the lock with channel back-pressure.
+        let new_lines = {
+            let mut prev = last_output.lock().await;
+            let new_lines = diff_lines(&prev, &current_lines);
+            *prev = current_lines;
+            new_lines
+        };
 
-        if !new_lines.is_empty() {
-            let content = new_lines.join("\n");
-
-            // Check for permission request patterns.
-            if contains_permission_prompt(&content) {
-                let request_id = format!("tmux-perm-{}", uuid::Uuid::new_v4());
-                let _ = tx
-                    .send(AgentEvent::PermissionRequest {
-                        request_id,
-                        tool: "tmux_permission".to_string(),
-                        input: serde_json::json!({"prompt": content.clone()}),
-                        options: vec![],
-                    })
-                    .await;
-            } else {
-                let _ = tx
-                    .send(AgentEvent::Text {
-                        content: content.clone(),
-                    })
-                    .await;
-                had_content = true;
+        if new_lines.is_empty() {
+            // No new output this tick. If the turn already produced content and
+            // has now been quiet long enough, the turn is finished.
+            if had_content {
+                quiet_ticks += 1;
+                if quiet_ticks >= QUIESCENCE_TICKS {
+                    let _ = tx
+                        .send(AgentEvent::Result {
+                            content: String::new(),
+                            session_id: String::new(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
+                        .await;
+                    had_content = false;
+                    quiet_ticks = 0;
+                }
             }
-
-            // Detect if Claude has finished (back to prompt / waiting state).
-            if had_content && looks_like_prompt_ready(&new_lines) {
-                let _ = tx
-                    .send(AgentEvent::Result {
-                        content: String::new(),
-                        session_id: String::new(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    })
-                    .await;
-                had_content = false;
-            }
+            continue;
         }
 
-        *prev = current_lines;
+        // New output arrived: the turn is still active, so reset the quiet timer.
+        quiet_ticks = 0;
+        let content = new_lines.join("\n");
+
+        // Check for permission request patterns.
+        if contains_permission_prompt(&content) {
+            let request_id = format!("tmux-perm-{}", uuid::Uuid::new_v4());
+            let _ = tx
+                .send(AgentEvent::PermissionRequest {
+                    request_id,
+                    tool: "tmux_permission".to_string(),
+                    input: serde_json::json!({"prompt": content.clone()}),
+                    options: vec![],
+                })
+                .await;
+        } else {
+            let _ = tx.send(AgentEvent::Text { content }).await;
+            had_content = true;
+        }
     }
+}
+
+/// Recreate a tmux session and relaunch claude inside it. Mirrors the auto_start
+/// path so an auto_restart resumes from the same launch command.
+async fn restart_session(session_name: &str, work_dir: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .args(["new-session", "-d", "-s", session_name, "-c", work_dir])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "tmux: failed to recreate session '{}': {}",
+            session_name,
+            stderr.trim()
+        ));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tmux_send_keys(session_name, "claude").await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +405,9 @@ async fn tmux_has_session(session_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Send text to a tmux session via send-keys (text is escaped, Enter is appended).
+/// Send text to a tmux session via send-keys, then press Enter. The `--` guard
+/// stops tmux from treating leading dashes as options; the text is otherwise
+/// typed verbatim (no shell is involved).
 async fn tmux_send_keys(session_name: &str, text: &str) -> Result<()> {
     let escaped = escape_for_tmux(text);
     let output = Command::new("tmux")
@@ -337,7 +421,7 @@ async fn tmux_send_keys(session_name: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send raw keys (like "y", "n", "C-c") without Enter.
+/// Send raw keys (like "1", "3", "C-c") followed by Enter.
 async fn tmux_send_raw_keys(session_name: &str, keys: &str) -> Result<()> {
     let output = Command::new("tmux")
         .args(["send-keys", "-t", session_name, keys, "Enter"])
@@ -348,6 +432,15 @@ async fn tmux_send_raw_keys(session_name: &str, keys: &str) -> Result<()> {
         return Err(anyhow!("tmux send-keys failed: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// Answer Claude Code's permission menu. The prompt is a numbered list
+/// (`❯ 1. Yes / 2. Yes, and don't ask again / 3. No`) navigated with digit
+/// keys, so approve maps to `1` and deny maps to `3` (each followed by Enter),
+/// not the `y`/`n` keys a classic yes/no prompt would use.
+async fn tmux_send_permission(session_name: &str, allow: bool) -> Result<()> {
+    let key = if allow { "1" } else { "3" };
+    tmux_send_raw_keys(session_name, key).await
 }
 
 /// Capture the last 100 lines from the tmux pane.
@@ -365,22 +458,16 @@ async fn tmux_capture_pane(session_name: &str) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-/// Escape text for safe use with `tmux send-keys`.
-/// Tmux interprets semicolons, quotes, and backslashes specially.
+/// Prepare text for `tmux send-keys`.
+///
+/// `tmux send-keys -- <arg>` hands the argument to tmux as a single argv token
+/// with no shell involved, so `$`, quotes, backticks, `\` and `;` are all typed
+/// literally. Shell-style escaping here would corrupt the prompt (e.g.
+/// `echo $HOME` becoming `echo \$HOME` inside Claude). The `--` guard in the
+/// caller stops tmux from treating leading dashes as options, which is the only
+/// real hazard, so the text passes through unchanged.
 fn escape_for_tmux(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len() + 16);
-    for ch in text.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            ';' => escaped.push_str("\\;"),
-            '\'' => escaped.push_str("'\\''"),
-            '"' => escaped.push_str("\\\""),
-            '$' => escaped.push_str("\\$"),
-            '`' => escaped.push_str("\\`"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
+    text.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -444,31 +531,26 @@ fn diff_lines(previous: &[String], current: &[String]) -> Vec<String> {
     }
 }
 
-/// Detect permission-related prompts in the terminal output.
+/// Detect Claude Code's permission prompt in the captured terminal output.
+///
+/// Claude Code asks for permission with a numbered menu, e.g.:
+///   Do you want to make this edit?
+///   ❯ 1. Yes
+///     2. Yes, and don't ask again this session
+///     3. No, and tell Claude what to do differently
+/// Matching that menu shape (a numbered "Yes" option plus a numbered "No"
+/// option or an explicit question) avoids firing on ordinary assistant prose
+/// like "I'll approve the PR" or "you don't have permission", which previously
+/// produced spurious permission requests that blocked the turn.
 fn contains_permission_prompt(content: &str) -> bool {
     let lower = content.to_lowercase();
-    // Claude Code asks things like "Allow tool?" or shows "allow" / "deny" buttons.
-    (lower.contains("allow") && (lower.contains("deny") || lower.contains("tool")))
-        || lower.contains("do you want to allow")
-        || lower.contains("approve")
-        || lower.contains("permission")
-}
-
-/// Detect if the last lines look like Claude is back at the input prompt.
-/// Claude Code shows a prompt marker (e.g. ">", "$", or the agent waiting indicator).
-fn looks_like_prompt_ready(lines: &[String]) -> bool {
-    if let Some(last) = lines.last() {
-        let trimmed = last.trim();
-        // Claude Code typically shows ">" when ready for input, or ends with "$"/"%" for shell.
-        trimmed == ">"
-            || trimmed.ends_with('>')
-            || trimmed.ends_with('$')
-            || trimmed.ends_with('%')
-            || trimmed.contains("Enter a prompt")
-            || trimmed.contains("What can I help")
-    } else {
-        false
-    }
+    let has_yes_option = lower.contains("1. yes") || lower.contains("1.yes");
+    let has_no_option = lower.contains("2. no")
+        || lower.contains("3. no")
+        || lower.contains("2.no")
+        || lower.contains("3.no");
+    let asks = lower.contains("do you want to");
+    has_yes_option && (has_no_option || asks)
 }
 
 #[cfg(test)]
@@ -477,12 +559,14 @@ mod tests {
 
     #[test]
     fn escape_for_tmux_handles_special_chars() {
+        // `tmux send-keys -- <arg>` involves no shell, so text passes through
+        // verbatim; escaping would corrupt the prompt typed into Claude.
         assert_eq!(escape_for_tmux("hello"), "hello");
-        assert_eq!(escape_for_tmux("a;b"), "a\\;b");
-        assert_eq!(escape_for_tmux("a\\b"), "a\\\\b");
-        assert_eq!(escape_for_tmux("he said \"hi\""), "he said \\\"hi\\\"");
-        assert_eq!(escape_for_tmux("$HOME"), "\\$HOME");
-        assert_eq!(escape_for_tmux("`cmd`"), "\\`cmd\\`");
+        assert_eq!(escape_for_tmux("a;b"), "a;b");
+        assert_eq!(escape_for_tmux("a\\b"), "a\\b");
+        assert_eq!(escape_for_tmux("he said \"hi\""), "he said \"hi\"");
+        assert_eq!(escape_for_tmux("echo $HOME"), "echo $HOME");
+        assert_eq!(escape_for_tmux("`cmd`"), "`cmd`");
     }
 
     #[test]
@@ -517,20 +601,18 @@ mod tests {
 
     #[test]
     fn contains_permission_prompt_detects_patterns() {
-        assert!(contains_permission_prompt("Allow tool? (y/n)"));
-        assert!(contains_permission_prompt("Do you want to allow this action?"));
-        assert!(contains_permission_prompt("Allow deny"));
-        assert!(!contains_permission_prompt("Hello world"));
-        assert!(!contains_permission_prompt("allow me to explain"));
-    }
+        // A realistic Claude-style permission menu must be detected.
+        let menu = "Do you want to make this edit?\n\
+                    ❯ 1. Yes\n\
+                    \x20 2. Yes, and don't ask again this session\n\
+                    \x20 3. No, and tell Claude what to do differently";
+        assert!(contains_permission_prompt(menu));
 
-    #[test]
-    fn looks_like_prompt_ready_detects_markers() {
-        assert!(looks_like_prompt_ready(&[">".to_string()]));
-        assert!(looks_like_prompt_ready(&["claude >".to_string()]));
-        assert!(looks_like_prompt_ready(&["user@host$".to_string()]));
-        assert!(looks_like_prompt_ready(&["Enter a prompt".to_string()]));
-        assert!(!looks_like_prompt_ready(&["some text".to_string()]));
-        assert!(!looks_like_prompt_ready(&[]));
+        // Ordinary assistant prose must NOT trigger a permission request.
+        assert!(!contains_permission_prompt("I'll approve the PR for you."));
+        assert!(!contains_permission_prompt(
+            "you don't have permission to edit this file"
+        ));
+        assert!(!contains_permission_prompt("Hello world"));
     }
 }
