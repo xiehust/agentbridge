@@ -246,17 +246,24 @@ async fn flush_transcript(
     };
     // Hold the cursor lock across the read so the critical section is serialized.
     let mut guard = cursor.lock().await;
-    let result = crate::transcript::read_blocks_after(transcript_path, guard.last_uuid.as_deref()).await;
 
-    // Always advance the cursor to whatever we read — even when not relaying —
-    // so Stop (and the initial seed) catch the cursor up past existing content.
+    // First flush after a fresh attach: seed the cursor to the most recent REAL
+    // user input (not the tail). This skips prior turns (history) but keeps the
+    // CURRENT turn — the content the model produced after the user's message —
+    // so attaching mid-turn doesn't swallow the answer the user is waiting for.
+    // Falls back to None (relay from start) only if no user input is found,
+    // which can't happen for a turn triggered by a user message.
+    if !guard.seeded {
+        guard.seeded = true;
+        guard.last_uuid = crate::transcript::seed_cursor(transcript_path).await;
+        tracing::info!("transcript cursor seeded to last user input (history skipped)");
+        // Fall through and relay from the seed point so the current turn ships.
+    }
+
+    let result = crate::transcript::read_blocks_after(transcript_path, guard.last_uuid.as_deref()).await;
     let advance_to = result.last_uuid.clone();
 
-    // First flush: seed only, never relay the pre-existing transcript.
-    let first_flush = !guard.seeded;
-    guard.seeded = true;
-
-    if relay && !first_flush {
+    if relay {
         let n = result.blocks.len();
         for block in result.blocks {
             let event = AgentEvent::ReplyChunk {
@@ -272,8 +279,6 @@ async fn flush_transcript(
         if n > 0 {
             tracing::info!(blocks = n, "relayed transcript reply chunks");
         }
-    } else if first_flush {
-        tracing::info!("transcript cursor seeded to tail (no replay of history)");
     }
 
     if let Some(uuid) = advance_to {
@@ -379,14 +384,22 @@ mod tests {
         serde_json::json!({"type":"assistant","uuid":uuid,"message":{"content":content}}).to_string()
     }
 
+    /// A real user-input line (typed prompt, content is a string).
+    fn user_jsonl(uuid: &str, text: &str) -> String {
+        serde_json::json!({"type":"user","uuid":uuid,"message":{"role":"user","content":text}})
+            .to_string()
+    }
+
     #[tokio::test]
-    async fn first_flush_seeds_without_replaying_history() {
-        // Attaching a long-lived session must NOT dump its prior transcript into
-        // chat. The first flush only seeds the cursor to the tail.
+    async fn first_flush_skips_history_but_relays_current_turn() {
+        // Attaching a long-lived session must NOT dump prior turns, but MUST
+        // relay the CURRENT turn (content after the latest user input) — else
+        // attaching mid-turn swallows the answer the user is waiting for.
         let reg = HookRouteRegistry::new();
         let (_d, path) = write_transcript(&[
-            &assistant_jsonl("h1", "历史回复一", "历史思考"),
-            &assistant_jsonl("h2", "历史回复二", ""),
+            &assistant_jsonl("h1", "历史回复(上一轮,应跳过)", "历史思考"),
+            &user_jsonl("u1", "用户这一轮的提问"),
+            &assistant_jsonl("a1", "这一轮的回复(应送达)", "这一轮的思考"),
         ]);
         let mut p = payload("PostToolUse");
         p.tmux_session = Some("sess-seed".to_string());
@@ -394,32 +407,50 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
         flush_transcript(&reg, &p, &path, &tx, true).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "first flush must seed only, not replay history"
-        );
+
+        let mut got = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ReplyChunk { content, .. } = ev {
+                got.push(content);
+            }
+        }
+        // History excluded, current turn (thinking+text after u1) included.
+        assert!(!got.iter().any(|c| c.contains("历史")), "history skipped: {got:?}");
+        assert!(got.iter().any(|c| c.contains("这一轮的思考")), "current thinking relayed: {got:?}");
+        assert!(got.iter().any(|c| c.contains("这一轮的回复")), "current reply relayed: {got:?}");
     }
 
     #[tokio::test]
     async fn flush_relays_new_chunks_after_seed() {
         let reg = HookRouteRegistry::new();
-        let (_d, path) = write_transcript(&[&assistant_jsonl("h1", "历史", "")]);
+        // Seed point is the user input u1; a1 is the current turn.
+        let (_d, path) = write_transcript(&[
+            &user_jsonl("u1", "提问"),
+            &assistant_jsonl("a1", "第一段", ""),
+        ]);
         let mut p = payload("PostToolUse");
         p.tmux_session = Some("sess-flush".to_string());
         p.transcript_path = Some(path.clone());
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
-        // First flush seeds to h1 (no relay).
+        // First flush seeds to u1 and relays the current turn (a1).
         flush_transcript(&reg, &p, &path, &tx, true).await;
-        assert!(rx.try_recv().is_err(), "seed flush relays nothing");
+        let mut first = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ReplyChunk { content, .. } = ev {
+                first.push(content);
+            }
+        }
+        assert_eq!(first, vec!["第一段".to_string()], "current turn relayed: {first:?}");
 
-        // New content arrives; rewrite the transcript with appended lines.
+        // More content arrives in the same turn.
         std::fs::write(
             &path,
             [
-                assistant_jsonl("h1", "历史", ""),
-                assistant_jsonl("a1", "我看一下", "先想想"),
-                assistant_jsonl("a2", "改 App.tsx", ""),
+                user_jsonl("u1", "提问"),
+                assistant_jsonl("a1", "第一段", ""),
+                assistant_jsonl("a2", "我看一下", "先想想"),
+                assistant_jsonl("a3", "改 App.tsx", ""),
             ]
             .join("\n"),
         )
@@ -432,13 +463,13 @@ mod tests {
                 got.push((content, thinking));
             }
         }
-        // thinking then text then text → 3 ReplyChunks in order (h1 excluded).
+        // Only the NEW lines (a2, a3); a1 already sent (dedup via cursor).
         assert_eq!(got.len(), 3, "got: {got:?}");
         assert_eq!(got[0], ("先想想".to_string(), true));
         assert_eq!(got[1], ("我看一下".to_string(), false));
         assert_eq!(got[2], ("改 App.tsx".to_string(), false));
 
-        // Third flush with the advanced cursor relays nothing (dedup).
+        // Third flush relays nothing (dedup).
         flush_transcript(&reg, &p, &path, &tx, true).await;
         assert!(rx.try_recv().is_err(), "no repeats on third flush");
     }

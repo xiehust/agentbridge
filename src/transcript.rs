@@ -52,7 +52,11 @@ struct Line {
 
 #[derive(Deserialize)]
 struct Message {
-    content: Option<Vec<ContentBlock>>,
+    // `content` is an array of blocks for assistant lines, but a plain STRING
+    // for a typed user input. Deserialize as untyped JSON so a user line (or
+    // any other shape) still parses — otherwise the whole line is dropped and
+    // its uuid can't anchor the cursor (which broke seed-to-user-input).
+    content: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -120,13 +124,15 @@ fn parse_after(raw: &str, after_uuid: Option<&str>) -> ReadResult {
         let Some(line_uuid) = parsed.uuid.clone() else {
             continue; // an assistant line without a uuid can't anchor the cursor
         };
-        let Some(content) = parsed.message.and_then(|m| m.content) else {
-            // Still advance the cursor: this assistant line has been consumed.
-            last_uuid = Some(line_uuid);
-            continue;
-        };
+        // `content` is untyped JSON; only an array carries relayable blocks. A
+        // non-array (or absent) content still advances the cursor.
+        let content_blocks: Vec<ContentBlock> = parsed
+            .message
+            .and_then(|m| m.content)
+            .and_then(|c| serde_json::from_value(c).ok())
+            .unwrap_or_default();
 
-        for b in content {
+        for b in content_blocks {
             match b.kind.as_deref() {
                 Some("text") => {
                     if let Some(t) = non_empty(b.text) {
@@ -158,6 +164,63 @@ fn parse_after(raw: &str, after_uuid: Option<&str>) -> ReadResult {
 /// `Some(trimmed)` if the string is present and not whitespace-only.
 fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|t| !t.trim().is_empty())
+}
+
+/// Find the cursor to SEED a freshly-attached session to: the uuid of the most
+/// recent *real user input* line (a typed prompt, not a tool_result), so that
+/// the assistant content of the CURRENT turn — everything after that input — is
+/// relayed, while all prior turns (history) are skipped.
+///
+/// Returns `None` if no real user input is found (e.g. an empty/odd transcript),
+/// in which case the caller should fall back to seeding at the tail.
+pub async fn seed_cursor(path: &str) -> Option<String> {
+    let raw = tokio::fs::read_to_string(path).await.ok()?;
+    seed_cursor_from(&raw)
+}
+
+/// Pure core of [`seed_cursor`], unit-testable.
+fn seed_cursor_from(raw: &str) -> Option<String> {
+    let mut last_input: Option<String> = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Parse loosely: we need type, uuid, and whether `message.content` is a
+        // plain string / has a text block (real input) vs a tool_result array.
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(uuid) = v.get("uuid").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        if is_real_user_input(&v) {
+            last_input = Some(uuid.to_string());
+        }
+    }
+    last_input
+}
+
+/// True when a `user` line is a typed prompt rather than a tool_result the
+/// harness injected. A real prompt's `message.content` is a string, or an array
+/// with no `tool_result` block; a tool result is an array containing a
+/// `tool_result` block.
+fn is_real_user_input(v: &serde_json::Value) -> bool {
+    let content = match v.get("message").and_then(|m| m.get("content")) {
+        Some(c) => c,
+        None => return false,
+    };
+    match content {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(arr) => !arr.iter().any(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+        }),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -300,4 +363,53 @@ mod tests {
         assert!(r.blocks.is_empty());
         assert_eq!(r.last_uuid, None);
     }
+
+    fn user_input_line(uuid: &str, text: &str) -> String {
+        serde_json::json!({"type":"user","uuid":uuid,"message":{"role":"user","content":text}})
+            .to_string()
+    }
+
+    fn tool_result_line(uuid: &str) -> String {
+        serde_json::json!({
+            "type":"user","uuid":uuid,
+            "message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn seed_cursor_picks_last_real_user_input() {
+        // Among history with several turns, seed to the MOST RECENT typed input,
+        // so the current turn (after it) is what gets relayed.
+        let jsonl = [
+            user_input_line("u1", "第一轮提问"),
+            assistant_line("a1", &[("text", "第一轮回复")]),
+            user_input_line("u2", "第二轮提问"),
+            assistant_line("a2", &[("text", "第二轮回复")]),
+        ]
+        .join("\n");
+        assert_eq!(seed_cursor_from(&jsonl).as_deref(), Some("u2"));
+    }
+
+    #[test]
+    fn seed_cursor_ignores_tool_results() {
+        // A tool_result is a `user` line too, but NOT a typed prompt — it must
+        // not be mistaken for the turn boundary.
+        let jsonl = [
+            user_input_line("u1", "提问"),
+            assistant_line("a1", &[("text", "回复"), ("tool_use", "Bash")]),
+            tool_result_line("tr1"),
+            assistant_line("a2", &[("text", "继续")]),
+        ]
+        .join("\n");
+        // Seed to u1 (the real input), NOT tr1 (the tool result).
+        assert_eq!(seed_cursor_from(&jsonl).as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn seed_cursor_none_when_no_user_input() {
+        let jsonl = assistant_line("a1", &[("text", "orphan")]);
+        assert_eq!(seed_cursor_from(&jsonl), None);
+    }
+
 }
