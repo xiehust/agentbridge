@@ -2041,6 +2041,7 @@ fn create_platform_capabilities(
     match config.platform_type.as_str() {
         "telegram" => crate::platforms::telegram::create(&config.options),
         "discord" => crate::platforms::discord::create(&config.options),
+        "feishu" | "lark" => crate::platforms::feishu::create(&config.options),
         other => anyhow::bail!("Unknown platform type: {other}"),
     }
 }
