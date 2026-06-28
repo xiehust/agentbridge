@@ -451,13 +451,17 @@ pub async fn process_agent_events(
 
                 preview.finish();
 
-                let mut final_text = if content.is_empty() && preview.was_active() {
+                let raw_final = if content.is_empty() && preview.was_active() {
                     preview.final_text().to_owned()
                 } else if content.is_empty() {
                     "(no response)".to_string()
                 } else {
                     content.clone()
                 };
+                // Markdown tables don't render on chat platforms (the pipes show
+                // literally and misalign on a phone); rewrite them into
+                // mobile-friendly cards before sending.
+                let mut final_text = crate::core::text_format::tables_to_cards(&raw_final);
 
                 // Append context indicator as percentage of context window
                 if display.context_indicator && input_tokens > 0 && display.context_window > 0 {
