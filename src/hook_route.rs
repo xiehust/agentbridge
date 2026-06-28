@@ -38,13 +38,23 @@ fn normalize(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// A per-session transcript cursor: the uuid of the last assistant line whose
-/// thinking/text has been relayed. A `tokio::sync::Mutex` because it is held
-/// across the async transcript read — the lock serializes the whole
-/// "read cursor → read transcript → advance cursor" critical section for one
-/// session, so concurrent PostToolUse hooks for the same session can't both
-/// relay the same blocks (the read-modify-write race).
-type Cursor = Arc<tokio::sync::Mutex<Option<String>>>;
+/// Per-session transcript cursor state, guarded by one `tokio::sync::Mutex`
+/// held across the async transcript read — the lock serializes the whole
+/// "read cursor → read transcript → advance cursor" critical section so
+/// concurrent hooks for one session can't double-process the same blocks
+/// (the read-modify-write race).
+#[derive(Default)]
+pub struct CursorState {
+    /// uuid of the last assistant line whose thinking/text has been processed.
+    pub last_uuid: Option<String>,
+    /// Whether this cursor has been seeded to the transcript's tail. The FIRST
+    /// flush after a fresh attach must NOT relay the pre-existing transcript
+    /// (a long session's whole history) — it only seeds the cursor to the
+    /// current end so subsequent flushes relay just the new content.
+    pub seeded: bool,
+}
+
+type Cursor = Arc<tokio::sync::Mutex<CursorState>>;
 
 /// Maps a bridged session to its event sender by two keys: tmux session name
 /// (exact, preferred) and canonicalized work_dir (prefix, fallback).
@@ -330,8 +340,8 @@ mod tests {
         assert!(Arc::ptr_eq(&c1, &c2), "same session must share one cursor");
 
         // Writing through one is visible through the other (same lock).
-        *c1.lock().await = Some("a2".to_string());
-        assert_eq!(c2.lock().await.as_deref(), Some("a2"));
+        c1.lock().await.last_uuid = Some("a2".to_string());
+        assert_eq!(c2.lock().await.last_uuid.as_deref(), Some("a2"));
     }
 
     #[tokio::test]
@@ -352,13 +362,13 @@ mod tests {
         let (tx, _rx) = drainable();
         reg.bind(&dir, Some("sess-c"), tx);
         let c = reg.transcript_cursor(Some("sess-c"), None).expect("cursor");
-        *c.lock().await = Some("a9".to_string());
+        c.lock().await.last_uuid = Some("a9".to_string());
 
         reg.unbind(&dir, Some("sess-c"));
         // After unbind a fresh cursor is handed out (not the stale Arc), so a
         // re-attached session starts clean.
         let c2 = reg.transcript_cursor(Some("sess-c"), None).expect("cursor");
         assert!(!Arc::ptr_eq(&c, &c2), "unbind must drop the old cursor");
-        assert_eq!(c2.lock().await.as_deref(), None, "fresh cursor is empty");
+        assert_eq!(c2.lock().await.last_uuid.as_deref(), None, "fresh cursor is empty");
     }
 }

@@ -611,33 +611,62 @@ async fn append_reply_chunk(
         content.trim().to_string()
     };
 
-    // Would appending overflow the current message? Count chars, not bytes.
-    let projected = buf.chars().count() + 1 + piece.chars().count();
-    let start_fresh = handle.is_none() || projected > REPLY_MSG_CAP;
+    // A single piece can itself exceed the platform cap (a long transcript
+    // block). Split it into cap-sized, char-boundary-safe segments first; each
+    // segment is then placed like a normal chunk. Without this, send_preview on
+    // an over-cap body is rejected (Discord 400 "Must be 2000 or fewer").
+    for segment in split_chars(&piece, REPLY_MSG_CAP) {
+        // Would appending overflow the current message? Count chars, not bytes.
+        let projected = buf.chars().count() + 1 + segment.chars().count();
+        let start_fresh = handle.is_none() || projected > REPLY_MSG_CAP;
 
-    if start_fresh {
-        // Finalize the current message (leave it as the trace) and open a new
-        // one. A single chunk larger than the cap still goes out whole — better
-        // an over-long message than a split mid-thought.
-        *buf = piece;
-        match updater.send_preview(ctx, buf).await {
-            Ok(h) => *handle = Some(h),
-            Err(e) => {
-                tracing::warn!(error = %e, "reply chunk send_preview failed");
-                *handle = None;
+        if start_fresh {
+            // Finalize the current message (leave it as the trace) and open a
+            // fresh one with this segment.
+            *buf = segment;
+            match updater.send_preview(ctx, buf).await {
+                Ok(h) => *handle = Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e, "reply chunk send_preview failed");
+                    *handle = None;
+                }
             }
-        }
-    } else {
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(&piece);
-        if let Some(h) = handle.as_ref() {
-            if let Err(e) = updater.update_preview(h.as_ref(), buf).await {
-                tracing::warn!(error = %e, "reply chunk update_preview failed");
+        } else {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(&segment);
+            if let Some(h) = handle.as_ref() {
+                if let Err(e) = updater.update_preview(h.as_ref(), buf).await {
+                    tracing::warn!(error = %e, "reply chunk update_preview failed");
+                }
             }
         }
     }
+}
+
+/// Split `s` into segments of at most `max` characters (not bytes), never
+/// cutting inside a codepoint. Returns at least one segment (possibly empty for
+/// an empty input is avoided by the caller).
+fn split_chars(s: &str, max: usize) -> Vec<String> {
+    if s.chars().count() <= max {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0;
+    for ch in s.chars() {
+        cur.push(ch);
+        n += 1;
+        if n >= max {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1122,31 @@ mod tests {
 
         let creates = rec.iter().filter(|r| matches!(r, Rec::PreviewCreate(_))).count();
         assert_eq!(creates, 2, "second chunk opens a new message: {rec:?}");
+    }
+
+    #[tokio::test]
+    async fn single_oversized_reply_chunk_is_split() {
+        // Regression: a single ReplyChunk longer than the cap used to be sent
+        // whole → Discord 400 "Must be 2000 or fewer". It must be split into
+        // multiple messages, each within the cap.
+        let huge = "字".repeat(5000); // ~2.6× REPLY_MSG_CAP in one chunk
+        let rec = drive(vec![reply_ev(&huge, false), result_ev("done")], true).await;
+
+        let creates: Vec<&Rec> = rec
+            .iter()
+            .filter(|r| matches!(r, Rec::PreviewCreate(_)))
+            .collect();
+        assert!(creates.len() >= 3, "5000 chars split into ≥3 messages: {}", creates.len());
+        // Every emitted body is within the cap.
+        for r in &rec {
+            if let Rec::PreviewCreate(t) | Rec::PreviewUpdate(t) = r {
+                assert!(
+                    t.chars().count() <= 1900,
+                    "every message within cap, got {} chars",
+                    t.chars().count()
+                );
+            }
+        }
     }
 
     #[tokio::test]
