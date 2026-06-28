@@ -459,9 +459,10 @@ pub async fn process_agent_events(
                     content.clone()
                 };
                 // Markdown tables don't render on chat platforms (the pipes show
-                // literally and misalign on a phone); rewrite them into
-                // mobile-friendly cards before sending.
-                let mut final_text = crate::core::text_format::tables_to_cards(&raw_final);
+                // literally and misalign on a phone); rewrite them into an
+                // aligned monospace code block — the closest a chat platform
+                // gets to a real table.
+                let mut final_text = crate::core::text_format::tables_to_aligned(&raw_final);
 
                 // Append context indicator as percentage of context window
                 if display.context_indicator && input_tokens > 0 && display.context_window > 0 {

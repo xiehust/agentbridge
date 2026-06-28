@@ -1,19 +1,19 @@
 //! Chat-friendly text rendering helpers.
 //!
 //! Chat platforms (Discord, Telegram) do not render GitHub-flavored Markdown
-//! tables — the `| --- |` pipes show literally and misalign on a narrow phone
-//! screen. [`tables_to_cards`] rewrites any Markdown table into a per-row
-//! "card": the first column becomes a bold heading and the remaining columns
-//! become `· Header: value` bullets, which reads cleanly on mobile.
+//! tables — the `| --- |` pipes show literally and misalign on a phone screen.
+//! [`tables_to_aligned`] rewrites any Markdown table into a monospace
+//! code-block with columns aligned by *visual* width (CJK glyphs count as two
+//! cells), which is the closest a chat platform gets to a real table.
 
-/// Rewrite every Markdown table in `text` into mobile-friendly cards, leaving
-/// all non-table text untouched. Idempotent on text with no tables.
+/// Rewrite every Markdown table in `text` into an aligned monospace code block,
+/// leaving all non-table text untouched. Idempotent on text with no tables.
 ///
 /// A table is detected as: a header row containing `|`, immediately followed by
 /// a separator row whose cells are all dashes (`---`, `:--:`, …), followed by
-/// zero or more body rows. Anything that doesn't match that exact shape is left
+/// one or more body rows. Anything that doesn't match that exact shape is left
 /// as-is, so a stray `|` in prose or code is never mangled.
-pub fn tables_to_cards(text: &str) -> String {
+pub fn tables_to_aligned(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -31,7 +31,7 @@ pub fn tables_to_cards(text: &str) -> String {
             // Only treat it as a table if it actually has body rows; otherwise
             // it's probably not a real table — leave the lines untouched.
             if !rows.is_empty() {
-                render_cards(&headers, &rows, &mut out);
+                render_aligned(&headers, &rows, &mut out);
                 i = j;
                 continue;
             }
@@ -57,9 +57,7 @@ fn is_separator_row(line: &str) -> bool {
     }
     cells.iter().all(|c| {
         let c = c.trim();
-        !c.is_empty()
-            && c.chars().all(|ch| ch == '-' || ch == ':')
-            && c.contains('-')
+        !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':') && c.contains('-')
     })
 }
 
@@ -72,26 +70,93 @@ fn split_row(line: &str) -> Vec<String> {
     t.split('|').map(|c| c.trim().to_string()).collect()
 }
 
-/// Render rows as cards into `out`. First column = bold heading; the rest =
-/// `· Header: value` bullets (header omitted if blank).
-fn render_cards(headers: &[String], rows: &[Vec<String>], out: &mut Vec<String>) {
-    for (idx, row) in rows.iter().enumerate() {
-        if idx > 0 {
-            out.push(String::new()); // blank line between cards
-        }
-        let title = row.first().map(|s| s.as_str()).unwrap_or("");
-        out.push(format!("\u{1f538} **{}**", title));
-        for (col, cell) in row.iter().enumerate().skip(1) {
-            let val = cell.trim();
-            if val.is_empty() {
-                continue;
-            }
-            match headers.get(col).map(|h| h.trim()).filter(|h| !h.is_empty()) {
-                Some(h) => out.push(format!("\u{00b7} {}: {}", h, val)),
-                None => out.push(format!("\u{00b7} {}", val)),
+/// Visual (monospace) width of a cell: CJK and other wide glyphs occupy two
+/// cells in a fixed-width font, so they must count as two for columns to align.
+/// Markdown emphasis markers (`*`, `` ` ``) are stripped first since they don't
+/// render in a code block.
+fn visual_width(s: &str) -> usize {
+    s.chars()
+        .filter(|c| !matches!(c, '*' | '`' | '_'))
+        .map(|c| if is_wide(c) { 2 } else { 1 })
+        .sum()
+}
+
+/// Strip emphasis markers that don't render inside a code block.
+fn strip_markers(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '*' | '`' | '_')).collect()
+}
+
+/// Whether a char is rendered double-width in a monospace font (CJK, kana,
+/// fullwidth forms, common CJK punctuation). Approximate but covers the ranges
+/// that matter for chat tables.
+fn is_wide(c: char) -> bool {
+    let u = c as u32;
+    (0x1100..=0x115F).contains(&u)        // Hangul Jamo
+        || (0x2E80..=0x303E).contains(&u) // CJK radicals, Kangxi, CJK symbols/punct
+        || (0x3041..=0x33FF).contains(&u) // Hiragana, Katakana, CJK symbols
+        || (0x3400..=0x4DBF).contains(&u) // CJK Ext A
+        || (0x4E00..=0x9FFF).contains(&u) // CJK Unified
+        || (0xA000..=0xA4CF).contains(&u) // Yi
+        || (0xAC00..=0xD7A3).contains(&u) // Hangul syllables
+        || (0xF900..=0xFAFF).contains(&u) // CJK compatibility
+        || (0xFE30..=0xFE4F).contains(&u) // CJK compatibility forms
+        || (0xFF00..=0xFF60).contains(&u) // Fullwidth forms
+        || (0xFFE0..=0xFFE6).contains(&u) // Fullwidth signs
+        || (0x1F300..=0x1FAFF).contains(&u) // emoji (wide)
+}
+
+/// Render the table as an aligned monospace code block into `out`. Columns are
+/// padded to their max visual width; the header is kept and a `---+---`
+/// separator drawn beneath it.
+fn render_aligned(headers: &[String], rows: &[Vec<String>], out: &mut Vec<String>) {
+    // All rows including the header participate in width computation.
+    let mut all: Vec<&[String]> = Vec::with_capacity(rows.len() + 1);
+    all.push(headers);
+    for r in rows {
+        all.push(r);
+    }
+    let num_cols = all.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 {
+        return;
+    }
+
+    let mut widths = vec![0usize; num_cols];
+    for r in &all {
+        for (k, cell) in r.iter().enumerate() {
+            let w = visual_width(cell);
+            if w > widths[k] {
+                widths[k] = w;
             }
         }
     }
+
+    // Pad a cell to its column's visual width (right-pad with spaces).
+    let pad = |cell: &str, col: usize| -> String {
+        let stripped = strip_markers(cell);
+        let w = visual_width(cell);
+        let fill = widths[col].saturating_sub(w);
+        format!("{}{}", stripped, " ".repeat(fill))
+    };
+
+    let render_row = |cells: &[String]| -> String {
+        (0..num_cols)
+            .map(|k| pad(cells.get(k).map(|s| s.as_str()).unwrap_or(""), k))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+
+    out.push("```".to_string());
+    out.push(render_row(headers));
+    // Separator line matching the column widths.
+    let sep = (0..num_cols)
+        .map(|k| "-".repeat(widths[k]))
+        .collect::<Vec<_>>()
+        .join("-+-");
+    out.push(sep);
+    for r in rows {
+        out.push(render_row(r));
+    }
+    out.push("```".to_string());
 }
 
 #[cfg(test)]
@@ -99,26 +164,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_simple_table_to_cards() {
+    fn converts_table_to_aligned_codeblock() {
         let input = "\
 | 办法 | 一句话 | 累不累 |
 |---|---|---|
 | 买 | 有公司卖 | 最省 |
 | 手动扒 | 浏览器登录跑 | 轻 |";
-        let out = tables_to_cards(input);
-        assert!(out.contains("\u{1f538} **买**"), "card title: {out}");
-        assert!(out.contains("\u{00b7} 一句话: 有公司卖"), "bullet w/ header: {out}");
-        assert!(out.contains("\u{00b7} 累不累: 最省"), "{out}");
-        assert!(out.contains("\u{1f538} **手动扒**"), "second card: {out}");
-        // No raw table pipes left.
-        assert!(!out.contains("|---|"), "separator gone: {out}");
-        assert!(!out.contains("| 买 |"), "raw row gone: {out}");
+        let out = tables_to_aligned(input);
+        // Wrapped in a code block.
+        assert!(out.starts_with("```\n"), "starts with code fence: {out}");
+        assert!(out.trim_end().ends_with("```"), "ends with code fence: {out}");
+        // Header + a separator line + content present.
+        assert!(out.contains("办法"), "{out}");
+        assert!(out.contains("有公司卖"), "{out}");
+        assert!(out.contains("-+-"), "separator drawn: {out}");
+        // No raw markdown separator row left.
+        assert!(!out.contains("|---|"), "md separator gone: {out}");
+    }
+
+    #[test]
+    fn columns_align_by_visual_width() {
+        // A CJK-heavy column and an ASCII column must line up: every body row's
+        // first ` | ` separator should sit at the same byte... no — same visual
+        // column. We check by asserting all rendered rows have equal display
+        // width up to the first separator.
+        let input = "\
+| 名 | n |
+|---|---|
+| 买 | 1 |
+| 手动扒 | 22 |";
+        let out = tables_to_aligned(input);
+        // The widest first-column cell is 手动扒 (3 CJK = width 6). Every row's
+        // first column should pad to 6, so " | " appears at a consistent place.
+        let body: Vec<&str> = out.lines().filter(|l| l.contains(" | ")).collect();
+        let first_seps: Vec<usize> = body
+            .iter()
+            .map(|l| visual_width(l.split(" | ").next().unwrap()))
+            .collect();
+        assert!(
+            first_seps.windows(2).all(|w| w[0] == w[1]),
+            "first column visual widths must match: {first_seps:?} in {out}"
+        );
     }
 
     #[test]
     fn leaves_non_table_text_untouched() {
         let input = "这是一段普通文字。\n用了 a | b 这种竖线但不是表格。\n下一行。";
-        assert_eq!(tables_to_cards(input), input);
+        assert_eq!(tables_to_aligned(input), input);
     }
 
     #[test]
@@ -131,36 +223,35 @@ mod tests {
 | x | y |
 
 后记一句。";
-        let out = tables_to_cards(input);
+        let out = tables_to_aligned(input);
         assert!(out.starts_with("前言一句。"), "{out}");
         assert!(out.trim_end().ends_with("后记一句。"), "{out}");
-        assert!(out.contains("\u{1f538} **x**"), "{out}");
-        assert!(out.contains("\u{00b7} 列B: y"), "{out}");
+        assert!(out.contains("```"), "code block present: {out}");
+        assert!(out.contains("x"), "{out}");
     }
 
     #[test]
     fn header_only_table_is_left_alone() {
-        // A header + separator with NO body rows isn't rendered as cards.
         let input = "| a | b |\n|---|---|";
-        assert_eq!(tables_to_cards(input), input);
+        assert_eq!(tables_to_aligned(input), input);
     }
 
     #[test]
-    fn cjk_and_wide_table_intact() {
+    fn strips_markdown_markers_inside_cells() {
         let input = "\
-| 名称 | 描述 | 点赞 | 收藏 | 评论 |
-|---|---|---|---|---|
-| 笔记一 | 很好的内容 | 100 | 50 | 20 |";
-        let out = tables_to_cards(input);
-        assert!(out.contains("\u{1f538} **笔记一**"));
-        assert!(out.contains("\u{00b7} 描述: 很好的内容"));
-        assert!(out.contains("\u{00b7} 点赞: 100"));
-        assert!(out.contains("\u{00b7} 评论: 20"));
+| 名称 | 状态 |
+|---|---|
+| **粗体名** | `代码` |";
+        let out = tables_to_aligned(input);
+        // Markers don't render in a code block, so they're stripped.
+        assert!(out.contains("粗体名"), "{out}");
+        assert!(!out.contains("**"), "asterisks stripped: {out}");
+        assert!(!out.contains('`') || out.matches("```").count() == 2, "backticks only the fences: {out}");
     }
 
     #[test]
     fn no_table_is_idempotent() {
         let input = "just a normal reply\nwith two lines";
-        assert_eq!(tables_to_cards(input), input);
+        assert_eq!(tables_to_aligned(input), input);
     }
 }
