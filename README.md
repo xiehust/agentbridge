@@ -49,6 +49,12 @@ projects:
           guild_id: "1234567890"       # optional, restrict to one server
           group_reply_all: true        # reply to every message (vs only @mentions)
           thread_isolation: false      # see "Working with multiple repos" below
+      - type: feishu                   # Feishu / Lark (long-connection, no public URL needed)
+        options:
+          app_id: "cli_xxxxxxxx"
+          app_secret: "your-app-secret"
+          group_reply_all: true        # reply to every group message (vs only @mentions)
+          # domain: lark               # optional: "lark" for larksuite.com (default feishu.cn)
     allow_from: "*"                    # or comma-separated user IDs
     rate_limit:
       max_messages: 20
@@ -68,7 +74,7 @@ agentbridge daemon install && agentbridge daemon start   # systemd user service
 
 ## Features
 
-- **Multi-platform**: Telegram and Discord adapters, pluggable architecture for more
+- **Multi-platform**: Telegram, Discord, and Feishu/Lark adapters, pluggable architecture for more
 - **Multi-agent**: Claude Code (native) + any ACP-compatible agent (Kiro CLI, Cursor, Gemini ACP mode); switch between agents mid-conversation with `/agent`
 - **Streaming responses**: Live message editing shows agent output as it generates
 - **Session management**: Multiple named sessions per user, persist across restarts, per-agent isolation
@@ -287,6 +293,48 @@ agentbridge daemon uninstall   Remove the service
 3. Generate an invite URL with `bot` + `applications.commands` scope and at minimum: Send Messages, Create Public Threads, Read Message History, Embed Links, Use Slash Commands
 4. Copy the bot token into your config
 5. Full guide: [docs/discord.md](docs/discord.md) (includes auth, intents, invite link, systemd)
+
+### Feishu / Lark
+
+Why Feishu, vs Telegram/Discord:
+
+- **No public URL / no webhook server.** It uses Feishu's WebSocket
+  long-connection: agentbridge dials *out* to Feishu and receives events on
+  that socket. Runs from a laptop or behind NAT with zero tunnelling — nothing
+  to expose, no firewall rules, no ngrok.
+- **Rich rendering.** Replies are sent as **interactive cards**, so the model's
+  Markdown — tables, bold, lists, code blocks — renders natively. (On
+  Discord/Telegram, Markdown tables don't render, so agentbridge falls back to
+  aligned code-block tables.)
+- **No app review to use it internally.** A custom app (企业自建应用) works
+  inside your own tenant immediately after publishing a version — no store
+  submission.
+- **Native "working" feedback.** Since there's no bot typing API, agentbridge
+  reacts 🫡 to your message on receipt and clears it when the reply lands.
+
+Setup:
+
+1. Create a **custom app** (企业自建应用) at the [Feishu Open Platform](https://open.feishu.cn) (or [Lark](https://open.larksuite.com))
+2. **Add the Bot capability** to the app (添加应用能力 → 机器人)
+3. **Permissions** (权限管理) — enable:
+   - `im:message` — read messages sent to the bot
+   - `im:message:send_as_bot` — send messages as the bot
+4. **Event subscription** (事件与回调 → 事件配置):
+   - Set the subscription mode to **「使用长连接接收事件」 (long-connection)**
+     — ⚠️ agentbridge must be running for this option to save (it requires a
+     live connection)
+   - Add the event **接收消息 `im.message.receive_v1`**
+5. **Publish a version** (版本管理与发布) so the bot capability + permissions take effect
+6. Copy the **App ID** and **App Secret** (凭证与基础信息) into your config
+7. **Add the bot to a group** — each group is one session, like a Discord channel
+8. Use `/attach <tmux-session>` in the group to bind it to a Claude Code session
+
+Notes:
+- A "received, working on it" indicator is shown by reacting 🫡 to your message
+  and removing it when the reply is sent (Feishu has no bot typing API).
+- A Feishu app's long-connection is **cluster mode** — only one client per app
+  receives each message. Don't point two tools (e.g. agentbridge and another
+  bot) at the **same** app; give each its own app.
 
 ---
 

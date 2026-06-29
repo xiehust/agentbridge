@@ -7,7 +7,9 @@
 //! `IncomingMessage` per inbound message, and invokes the engine's
 //! `MessageHandler`.
 //!
-//! Outbound message ids:
+//! Outbound messages are interactive cards (`msg_type: "interactive"`) whose
+//! body is a single Markdown component, so the model's Markdown — tables, bold,
+//! lists, code — renders natively. Operation ids:
 //! - send  → `im.v1.message.create`  (POST /messages)
 //! - edit  → `im.v1.message.patch`   (PATCH /messages/:id)  — streaming preview
 //! - delete→ `im.v1.message.delete`  (DELETE /messages/:id)
@@ -31,9 +33,13 @@ use feishu_sdk::Client;
 use crate::core::message::IncomingMessage;
 use crate::core::platform::{
     MessageHandler, MessageUpdater, Platform, PlatformCapabilities, PreviewHandle, ReplyCtx,
+    TypingIndicator,
 };
 
 use types::{FeishuPreviewHandle, FeishuReplyCtx};
+
+/// The emoji shown on the user's message while the bot is working ("on it").
+const WORKING_EMOJI: &str = "OnIt";
 
 /// Config options for a `feishu` (or `lark`) platform entry.
 #[derive(Debug, Deserialize)]
@@ -101,11 +107,14 @@ impl FeishuPlatform {
     }
 
     /// Send a text message to a chat, returning the created message id.
-    async fn send_text(&self, chat_id: &str, text: &str) -> Result<String> {
+    /// Send an interactive card whose body is one Markdown component, returning
+    /// the created message id. The card renders the model's raw Markdown
+    /// (bold, lists, tables, code) natively — far richer than plain text.
+    async fn send_card(&self, chat_id: &str, markdown: &str) -> Result<String> {
         let body = serde_json::json!({
             "receive_id": chat_id,
-            "msg_type": "text",
-            "content": serde_json::json!({ "text": text }).to_string(),
+            "msg_type": "interactive",
+            "content": build_card(markdown).to_string(),
         });
         let resp = self
             .client
@@ -116,15 +125,54 @@ impl FeishuPlatform {
             .send()
             .await
             .map_err(|e| anyhow!("feishu send: {e:?}"))?;
-        parse_message_id(&resp.body)
-            .ok_or_else(|| anyhow!("feishu send: no message_id in response"))
+        // Feishu returns HTTP 200 even on app-level failures (non-zero `code`
+        // in the body), so the response body is the real signal — log it.
+        let body_str = String::from_utf8_lossy(&resp.body);
+        match parse_message_id(&resp.body) {
+            Some(id) => {
+                tracing::info!(status = resp.status, message_id = %id, "feishu card sent");
+                Ok(id)
+            }
+            None => {
+                tracing::warn!(status = resp.status, body = %body_str, "feishu card send failed");
+                Err(anyhow!("feishu send failed: {body_str}"))
+            }
+        }
     }
+
+    /// Add an emoji reaction to a message, returning the reaction id (needed to
+    /// remove it later). Used as the "bot is working" indicator on the user's
+    /// message — the Feishu equivalent of a typing indicator.
+    async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<String> {
+        let body = serde_json::json!({ "reaction_type": { "emoji_type": emoji_type } });
+        let resp = self
+            .client
+            .operation("im.v1.message_reaction.create")
+            .path_param("message_id", message_id)
+            .body_json(&body)
+            .map_err(|e| anyhow!("feishu reaction body: {e:?}"))?
+            .send()
+            .await
+            .map_err(|e| anyhow!("feishu reaction: {e:?}"))?;
+        serde_json::from_slice::<serde_json::Value>(&resp.body)
+            .ok()
+            .and_then(|v| v.pointer("/data/reaction_id").and_then(|r| r.as_str()).map(String::from))
+            .ok_or_else(|| anyhow!("feishu reaction: no reaction_id"))
+    }
+
 }
 
 #[async_trait]
 impl Platform for FeishuPlatform {
     fn name(&self) -> &str {
         "feishu"
+    }
+
+    /// Feishu replies are interactive cards with a Markdown component, which
+    /// renders tables/bold/lists natively — so the engine sends raw Markdown
+    /// rather than the code-block table fallback used for plain-text platforms.
+    fn renders_markdown(&self) -> bool {
+        true
     }
 
     async fn start(&self, handler: MessageHandler) -> Result<()> {
@@ -169,7 +217,7 @@ impl Platform for FeishuPlatform {
 
     async fn reply(&self, ctx: &dyn ReplyCtx, content: &str) -> Result<()> {
         let chat_id = chat_id_of(ctx)?;
-        self.send_text(&chat_id, content).await?;
+        self.send_card(&chat_id, content).await?;
         Ok(())
     }
 
@@ -188,6 +236,10 @@ impl PlatformCapabilities for FeishuPlatform {
     fn as_message_updater(&self) -> Option<&dyn MessageUpdater> {
         Some(self)
     }
+
+    fn as_typing_indicator(&self) -> Option<&dyn TypingIndicator> {
+        Some(self)
+    }
 }
 
 #[async_trait]
@@ -198,7 +250,7 @@ impl MessageUpdater for FeishuPlatform {
         text: &str,
     ) -> Result<Box<dyn PreviewHandle>> {
         let chat_id = chat_id_of(ctx)?;
-        let message_id = self.send_text(&chat_id, text).await?;
+        let message_id = self.send_card(&chat_id, text).await?;
         Ok(Box::new(FeishuPreviewHandle { message_id }))
     }
 
@@ -207,11 +259,12 @@ impl MessageUpdater for FeishuPlatform {
             .as_any()
             .downcast_ref::<FeishuPreviewHandle>()
             .ok_or_else(|| anyhow!("feishu: wrong preview handle type"))?;
-        // Edit in place via message.patch. content is the same JSON-string shape.
+        // Edit in place via message.patch with the updated card content.
         let body = serde_json::json!({
-            "content": serde_json::json!({ "text": text }).to_string(),
+            "content": build_card(text).to_string(),
         });
-        self.client
+        let resp = self
+            .client
             .operation("im.v1.message.patch")
             .path_param("message_id", &h.message_id)
             .body_json(&body)
@@ -219,6 +272,11 @@ impl MessageUpdater for FeishuPlatform {
             .send()
             .await
             .map_err(|e| anyhow!("feishu patch: {e:?}"))?;
+        // Surface app-level failures (HTTP 200 + non-zero code).
+        let body_str = String::from_utf8_lossy(&resp.body);
+        if !body_str.contains("\"code\":0") {
+            tracing::warn!(status = resp.status, body = %body_str, "feishu card patch failed");
+        }
         Ok(())
     }
 
@@ -234,6 +292,41 @@ impl MessageUpdater for FeishuPlatform {
             .await
             .map_err(|e| anyhow!("feishu delete: {e:?}"))?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl TypingIndicator for FeishuPlatform {
+    /// "Bot is working" indicator: add a 🫡 (OnIt) reaction to the user's
+    /// message; the returned callback removes it once the reply is sent. This
+    /// is the Feishu stand-in for a typing indicator — feishu has no bot typing
+    /// API, but a reaction on the triggering message reads the same: "received,
+    /// working on it." Reaction add/remove was verified live before shipping.
+    async fn start_typing(&self, ctx: &dyn ReplyCtx) -> Result<Box<dyn FnOnce() + Send>> {
+        let message_id = ctx
+            .as_any()
+            .downcast_ref::<FeishuReplyCtx>()
+            .and_then(|c| c.message_id.clone())
+            .ok_or_else(|| anyhow!("feishu: no message_id to react to"))?;
+
+        let reaction_id = self.add_reaction(&message_id, WORKING_EMOJI).await?;
+
+        // The stop callback is sync; spawn the async removal. Clone the client
+        // (it's cheap and Clone) so the closure owns what it needs.
+        let client = self.client.clone();
+        Ok(Box::new(move || {
+            tokio::spawn(async move {
+                let r = client
+                    .operation("im.v1.message_reaction.delete")
+                    .path_param("message_id", &message_id)
+                    .path_param("reaction_id", &reaction_id)
+                    .send()
+                    .await;
+                if let Err(e) = r {
+                    tracing::warn!(error = %e, "feishu: failed to remove working reaction");
+                }
+            });
+        }))
     }
 }
 
@@ -350,6 +443,21 @@ fn strip_mention_tokens(text: &str) -> String {
         .join(" ")
 }
 
+/// Build a Feishu interactive card (JSON 2.0) whose body is one Markdown
+/// element holding `markdown`. Feishu renders Markdown — including tables,
+/// bold, lists, and code — natively inside this component.
+fn build_card(markdown: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "body": {
+            "elements": [
+                { "tag": "markdown", "content": markdown }
+            ]
+        }
+    })
+}
+
 /// Pull `data.message_id` out of an IM API JSON response body.
 fn parse_message_id(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -385,6 +493,15 @@ mod tests {
         assert_eq!(strip_mention_tokens("@_user_1 hello world"), "hello world");
         assert_eq!(strip_mention_tokens("no mention here"), "no mention here");
         assert_eq!(strip_mention_tokens("@_all 大家好"), "大家好");
+    }
+
+    #[test]
+    fn build_card_wraps_markdown() {
+        let card = build_card("**hi**\n| a | b |\n|---|---|\n| 1 | 2 |");
+        assert_eq!(card["schema"], "2.0");
+        let el = &card["body"]["elements"][0];
+        assert_eq!(el["tag"], "markdown");
+        assert!(el["content"].as_str().unwrap().contains("| a | b |"));
     }
 
     #[test]

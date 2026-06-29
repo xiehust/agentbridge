@@ -93,6 +93,15 @@ pub trait Platform: Send + Sync {
         Ok(())
     }
 
+    /// Whether this platform natively renders Markdown (including tables) in
+    /// message bodies. When true, the engine sends the model's raw Markdown
+    /// through unchanged; when false (the default — Discord, Telegram), the
+    /// engine rewrites Markdown tables into an aligned code block, since plain
+    /// chat text doesn't render `| --- |`. Feishu cards override this to true.
+    fn renders_markdown(&self) -> bool {
+        false
+    }
+
     /// Gracefully shut down the platform connection.
     async fn stop(&self) -> Result<()>;
 }
