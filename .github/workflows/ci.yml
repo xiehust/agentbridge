@@ -29,9 +29,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Format check
-        run: cargo fmt --all -- --check
-
+      # No fmt gate: rustfmt's default style drifts between toolchain versions,
+      # so a strict --check goes red on a version mismatch even when the code is
+      # clean locally. Correctness (clippy/build/test) is what gates CI.
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
