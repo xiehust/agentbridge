@@ -1,6 +1,9 @@
 # agentbridge
 
-Bridge Claude Code (and other AI coding agents) to your favorite chat apps. Control your AI coding agent from Telegram, Discord, and more — without a public IP or reverse proxy.
+[![CI](https://github.com/warren830/agentbridge/actions/workflows/ci.yml/badge.svg)](https://github.com/warren830/agentbridge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Bridge Claude Code (and other AI coding agents) to your favorite chat apps. Control your AI coding agent from Telegram, Discord, Feishu/Lark, and more — without a public IP or reverse proxy.
 
 ## Quick Start
 
