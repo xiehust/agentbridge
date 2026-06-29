@@ -6,19 +6,19 @@ Bridge Claude Code (and other AI coding agents) to your favorite chat apps. Cont
 
 ### Install
 
-**From npm (recommended):**
-
-```bash
-npm install -g agentbridge
-```
+Requires [Rust](https://rustup.rs) (stable) and a working `claude` CLI on PATH.
 
 **From source:**
 
 ```bash
-git clone git@github.com:warren830/agentbridge.git
+git clone https://github.com/warren830/agentbridge.git
 cd agentbridge
 cargo build --release
+# binary is at target/release/agentbridge — put it on your PATH:
+sudo cp target/release/agentbridge /usr/local/bin/   # or: cp ... ~/.local/bin/
 ```
+
+Verify with `agentbridge --version`.
 
 ### Configure
 
