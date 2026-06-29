@@ -396,7 +396,7 @@ impl SessionManager {
             .map(Arc::clone)
             .collect();
 
-        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        result.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         result
     }
 
@@ -411,7 +411,7 @@ impl SessionManager {
             .map(Arc::clone)
             .collect();
 
-        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        result.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         result
     }
 
