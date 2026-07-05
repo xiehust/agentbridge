@@ -467,11 +467,11 @@ async fn poll_loop(
         // only extract+emit once the turn is idle, so each reply is sent exactly
         // once, whole and clean.
         //
-        // Busy is the ONE reliable signal: "esc to interrupt" appears only while
-        // a turn is actively running and disappears the instant it ends. (Do
-        // NOT fold spinner/`Cooked for` footers into busy — those stay in the
-        // scrollback as stale history and would wedge the turn forever.)
-        let busy = current_lines.iter().any(|l| l.contains("esc to interrupt"));
+        // Busy detection lives in screen_is_busy(): the legacy "esc to
+        // interrupt" hint plus the newer bare spinner status line (`✽ …`).
+        // Done footers ("Cooked for 9s") must never count — they persist in
+        // scrollback and would wedge the turn forever.
+        let busy = screen_is_busy(&current_lines);
         // Idle = not busy, and an input box is present. Defined negatively so it
         // survives footer changes and a tmux status bar (which appears when a
         // human also attaches the session and hid the "? for shortcuts" line).
@@ -815,6 +815,34 @@ fn escape_for_tmux(text: &str) -> String {
 // Output extraction (whitelist Claude's `⏺` reply blocks)
 // ---------------------------------------------------------------------------
 
+/// Whether a captured screen shows an ACTIVE turn.
+///
+/// Two fingerprints, because the cc TUI changed across versions:
+/// 1. Legacy: the literal "esc to interrupt" hint, shown only while a turn
+///    runs (anywhere on screen).
+/// 2. 2026-07 TUI: the hint is gone and the input box stays visible during
+///    the turn; the live signal is the spinner status line (`✽ Zigzagging…`).
+///    Discriminators, both load-bearing:
+///    - the TRAILING ELLIPSIS: a finished turn's footer ("✻ Brewed for 56s")
+///      persists in scrollback and must not read as busy;
+///    - the TAIL BOUND: the live spinner sits near the input box, so only the
+///      last few lines are checked — glyph+ellipsis text inside old reply
+///      prose can never wedge the turn.
+fn screen_is_busy(lines: &[String]) -> bool {
+    if lines.iter().any(|l| l.contains("esc to interrupt")) {
+        return true;
+    }
+    const SPINNER_GLYPHS: [char; 6] = ['✢', '✳', '✶', '✻', '✽', '✺'];
+    const TAIL: usize = 15;
+    lines.iter().rev().take(TAIL).any(|l| {
+        let t = l.trim();
+        t.chars()
+            .next()
+            .is_some_and(|c| SPINNER_GLYPHS.contains(&c))
+            && (t.ends_with('…') || t.ends_with("..."))
+    })
+}
+
 /// Whether the poll loop should emit a visible heartbeat (`Thinking`) this tick.
 /// Gated off in hook relay mode because the heartbeat renders as a user-visible
 /// `🧠 Working…` message and detaches the live preview (BR-14).
@@ -1093,6 +1121,63 @@ fn extract_selection_menu(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn busy_detects_legacy_esc_hint() {
+        let s = screen(&["  some output", "✳ Working… (esc to interrupt)", "❯ "]);
+        assert!(screen_is_busy(&s));
+    }
+
+    #[test]
+    fn busy_detects_bare_spinner_status_line() {
+        // Real capture from a 2026-07 cc TUI: the "esc to interrupt" hint is
+        // gone and the input box stays visible DURING the turn — the old
+        // fingerprint read this as idle, so the settle safety-net fired
+        // mid-turn and ended it with an empty Result (answer lost).
+        let s = screen(&[
+            "❯ 现在怎么样了",
+            "✽ Zigzagging…",
+            "                    100% context used",
+            "──────────────────────────",
+            "❯ ",
+            "──────────────────────────",
+            "  [AIDLC] ready | opus-4-8 ctx:100%",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        ]);
+        assert!(screen_is_busy(&s), "live spinner status line must read as busy");
+    }
+
+    #[test]
+    fn done_footer_is_not_busy() {
+        // Finished-turn footers persist in scrollback ("✻ Brewed for 56s",
+        // real capture) — they must NOT read as busy or the turn would wedge
+        // forever. The discriminator is the trailing ellipsis.
+        let s = screen(&[
+            "✻ Brewed for 56s",
+            "──────────────────────────",
+            "❯ ",
+            "──────────────────────────",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        ]);
+        assert!(!screen_is_busy(&s));
+    }
+
+    #[test]
+    fn spinner_text_deep_in_scrollback_is_not_busy() {
+        // A glyph+ellipsis line inside old reply prose must not wedge the
+        // turn: the spinner check is bounded to the tail of the capture.
+        let mut lines: Vec<String> = vec!["✻ pondering…".to_string()];
+        for i in 0..30 {
+            lines.push(format!("  reply prose line {}", i));
+        }
+        lines.push("❯ ".to_string());
+        lines.push("  ⏵⏵ bypass permissions on".to_string());
+        assert!(!screen_is_busy(&lines));
+    }
 
     #[test]
     fn hook_mode_gates_off_heartbeat() {
