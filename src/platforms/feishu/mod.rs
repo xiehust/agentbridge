@@ -25,7 +25,9 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use feishu_sdk::core::{noop_logger, Config, Error as FsError, FEISHU_BASE_URL, LARK_BASE_URL};
+use feishu_sdk::core::{
+    Config, Error as FsError, LogLevel, Logger, LoggerRef, FEISHU_BASE_URL, LARK_BASE_URL,
+};
 use feishu_sdk::event::{Event, EventDispatcher, EventDispatcherConfig, EventHandler, EventResp};
 use feishu_sdk::ws::StreamClient;
 use feishu_sdk::Client;
@@ -59,6 +61,34 @@ pub struct FeishuOptions {
 
 fn default_true() -> bool {
     true
+}
+
+/// Bridge the SDK's internal logging into `tracing`. The SDK logs the entire
+/// long-connection lifecycle (event dispatch, "no handler registered",
+/// challenge requests) that is otherwise invisible — a silently-dead feishu
+/// channel is undiagnosable without it.
+#[derive(Debug)]
+struct TracingLogger;
+
+impl Logger for TracingLogger {
+    // No custom `target:` — the default (this module's path) already matches
+    // the `agentbridge=info` EnvFilter; a foreign target would be filtered out.
+    fn log(&self, level: LogLevel, message: &str) {
+        match level {
+            LogLevel::Error => tracing::error!("feishu-sdk: {message}"),
+            LogLevel::Warn => tracing::warn!("feishu-sdk: {message}"),
+            LogLevel::Info => tracing::info!("feishu-sdk: {message}"),
+            LogLevel::Debug => tracing::debug!("feishu-sdk: {message}"),
+        }
+    }
+
+    fn is_enabled(&self, level: LogLevel) -> bool {
+        level >= LogLevel::Debug
+    }
+}
+
+fn tracing_logger() -> LoggerRef {
+    Arc::new(TracingLogger)
 }
 
 pub struct FeishuPlatform {
@@ -203,7 +233,7 @@ impl Platform for FeishuPlatform {
             let allow_from = allow_from.clone();
             async move {
                 let dispatcher =
-                    EventDispatcher::new(EventDispatcherConfig::new(), noop_logger());
+                    EventDispatcher::new(EventDispatcherConfig::new(), tracing_logger());
                 dispatcher
                     .register_handler(Box::new(MessageReceiveHandler {
                         handler,
@@ -212,9 +242,13 @@ impl Platform for FeishuPlatform {
                         group_reply_all,
                     }))
                     .await;
-                let config = Config::builder(&app_id, &app_secret)
+                let mut config = Config::builder(&app_id, &app_secret)
                     .base_url(&base_url)
                     .build();
+                // Route the stream client's internal logs (frame dispatch,
+                // reconnects) through tracing instead of the SDK's raw
+                // eprintln default.
+                config.logger = tracing_logger();
                 StreamClient::builder(config)
                     .event_dispatcher(dispatcher)
                     .build()

@@ -322,8 +322,15 @@ running with your credentials):
    **Every person/machine needs their OWN app** — see the cluster-mode note below.
 2. **Add the Bot capability** to the app (添加应用能力 → 机器人)
 3. **Permissions** (权限管理) — enable:
-   - `im:message` — read messages sent to the bot
+   - `im:message.p2p_msg:readonly` — receive DMs sent to the bot
+   - `im:message.group_at_msg:readonly` — receive group messages that @-mention
+     the bot, **or** `im:message.group_msg` (sensitive scope) to receive *all*
+     group messages — required for `group_reply_all: true`
    - `im:message:send_as_bot` — send messages as the bot
+
+   ⚠️ Subscribing to the event alone delivers **nothing**: Feishu decides
+   which messages to push based on which of these scopes the app has. Missing
+   scopes fail silently — the long-connection stays up but no events arrive.
 4. Copy the **App ID** and **App Secret** (凭证与基础信息) into your config,
    then **start agentbridge** — the next step requires a live connection
 5. **Event subscription** (事件与回调 → 事件配置):
@@ -363,17 +370,21 @@ in order:
    both sides.
 2. **Event missing**: 接收消息 `im.message.receive_v1` must appear in the
    event list — the long-connection mode toggle alone delivers nothing.
-3. **Not published / out of scope**: permissions apply only after 发布版本,
+3. **Receive scopes missing**: the event subscription only defines *what* you
+   listen for; the scopes in step 3 define *which messages Feishu pushes*.
+   Without `im:message.p2p_msg:readonly` (DMs) / a group receive scope, the
+   connection stays green and zero events arrive.
+4. **Not published / out of scope**: permissions apply only after 发布版本,
    and the sender must be inside the app's 可用范围. Custom apps work only
    inside their own tenant.
-4. **`allow_from` filter**: if set in your config, senders not on the list
+5. **`allow_from` filter**: if set in your config, senders not on the list
    are dropped **silently**. Leave it unset (or `"*"`) while setting up.
-5. **Group gates**: the bot must be a member of the group; with
+6. **Group gates**: the bot must be a member of the group; with
    `group_reply_all: false` it only answers when @mentioned.
-6. **Localize with logs**: run `RUST_LOG=agentbridge=debug agentbridge run`,
+7. **Localize with logs**: run `RUST_LOG=agentbridge=debug agentbridge run`,
    send a test message, and look for `handle_message: received`:
    - absent → the message never reached the bridge — the problem is on the
-     Feishu side (points 1-5);
+     Feishu side (points 1-6);
    - present but no reply → Feishu is fine, the agent side is failing —
      check `tmux ls` shows your session, Claude Code is running inside it,
      `/attach` was issued in the group, and `hook-install` + cc restart were
