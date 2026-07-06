@@ -19,6 +19,13 @@ type OverrideMap = tokio::sync::Mutex<HashMap<(String, String), String>>;
 
 const AVAILABLE_MODES: &[&str] = &["default", "yolo", "plan", "auto"];
 
+/// Whether `args` names a recognised permission mode. Used by the engine to
+/// decide if a `/mode` invocation actually changed anything (and therefore
+/// requires an agent restart).
+pub fn is_valid_mode(args: &str) -> bool {
+    AVAILABLE_MODES.contains(&args)
+}
+
 // ---------------------------------------------------------------------------
 // Command dispatcher
 // ---------------------------------------------------------------------------
@@ -649,6 +656,34 @@ mod tests {
         let reply = cmd_resume(&mgr, "discord:chan", "claude", &s1.id[..8]);
         assert!(reply.contains("Switched to"), "got: {reply}");
         assert_eq!(mgr.get_or_create("discord:chan").id, s1.id);
+    }
+
+    #[test]
+    fn valid_modes_recognised() {
+        for m in AVAILABLE_MODES {
+            assert!(is_valid_mode(m), "{m} should be valid");
+        }
+        assert!(!is_valid_mode(""));
+        assert!(!is_valid_mode("bogus"));
+    }
+
+    #[tokio::test]
+    async fn model_override_set_and_reported() {
+        let yaml = r#"
+name: t
+work_dir: /tmp
+agents:
+  - name: claude
+    backend: claude
+"#;
+        let config: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let overrides: OverrideMap = tokio::sync::Mutex::new(HashMap::new());
+        let set_reply =
+            cmd_model(&config, "discord:chan", "claude", &overrides, "claude-5").await;
+        assert!(set_reply.contains("claude-5"), "got: {set_reply}");
+        let show_reply = cmd_model(&config, "discord:chan", "claude", &overrides, "").await;
+        assert!(show_reply.contains("claude-5"), "got: {show_reply}");
+        assert!(show_reply.contains("override"), "got: {show_reply}");
     }
 }
 
