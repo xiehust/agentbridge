@@ -320,14 +320,22 @@ Setup:
 1. Create a **custom app** (企业自建应用) at the [Feishu Open Platform](https://open.feishu.cn) (or [Lark](https://open.larksuite.com))
 2. **Add the Bot capability** to the app (添加应用能力 → 机器人)
 3. **Permissions** (权限管理) — enable:
-   - `im:message` — read messages sent to the bot
+   - `im:message.p2p_msg:readonly` — receive DMs sent to the bot
+   - `im:message.group_at_msg:readonly` — receive group messages that @-mention
+     the bot, **or** `im:message.group_msg` (sensitive scope) to receive *all*
+     group messages — required for `group_reply_all: true`
    - `im:message:send_as_bot` — send messages as the bot
+
+   ⚠️ Subscribing to the event alone delivers **nothing**: Feishu decides
+   which messages to push based on which of these scopes the app has. Missing
+   scopes fail silently — the long-connection stays up but no events arrive.
 4. **Event subscription** (事件与回调 → 事件配置):
    - Set the subscription mode to **「使用长连接接收事件」 (long-connection)**
      — ⚠️ agentbridge must be running for this option to save (it requires a
      live connection)
    - Add the event **接收消息 `im.message.receive_v1`**
-5. **Publish a version** (版本管理与发布) so the bot capability + permissions take effect
+5. **Publish a version** (版本管理与发布) so the bot capability + permissions
+   take effect — permission changes do nothing until a version is published
 6. Copy the **App ID** and **App Secret** (凭证与基础信息) into your config
 7. **Add the bot to a group** — each group is one session, like a Discord channel
 8. Use `/attach <tmux-session>` in the group to bind it to a Claude Code session
