@@ -425,6 +425,7 @@ impl ClaudeAgent {
         tracing::info!(
             work_dir = %effective_work_dir.display(),
             mode = %mode,
+            model = ?model,
             session_id = ?session_id,
             "agent: spawning claude session"
         );

@@ -1788,9 +1788,10 @@ async fn handle_command_message(
     .await;
 
     if let Some(reply_text) = reply {
-        // If session or work directory changed, kill the running agent process
-        // so the next message spawns a fresh one in the correct context.
-        if matches!(cmd, "new" | "switch" | "delete" | "dir" | "cd" | "attach" | "resume") {
+        let claude_backend = config
+            .find_agent(&agent_name)
+            .is_none_or(|e| e.backend == "claude");
+        if should_restart_agent(cmd, args, claude_backend) {
             let session_key = make_session_key(&platform, msg);
             cleanup_agent_session(config, sessions, interactive_states, hook_route, &session_key).await;
         }
@@ -1800,6 +1801,66 @@ async fn handle_command_message(
 
     // Not a built-in command -- caller will check custom commands and skills
     Ok(false)
+}
+
+/// Whether a built-in command requires killing the running agent process so
+/// the next message spawns a fresh one in the correct context.
+///
+/// Session/work-dir changes always do. `/model` and `/mode` (with a value)
+/// also do for the claude backend: `--model` and `--permission-mode` are
+/// spawn-time CLI flags, and the claude subprocess is persistent across
+/// turns — a live agent would keep answering with the old settings forever.
+/// The agent session id survives in SessionManager, so the next message
+/// resumes the same conversation with the new flags applied. Other backends
+/// (acp, tmux) ignore these overrides, so their agents keep running.
+fn should_restart_agent(cmd: &str, args: &str, claude_backend: bool) -> bool {
+    matches!(
+        cmd,
+        "new" | "switch" | "delete" | "dir" | "cd" | "attach" | "resume"
+    ) || (claude_backend
+        && ((cmd == "model" && !args.is_empty())
+            || (cmd == "mode" && commands::is_valid_mode(args))))
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::should_restart_agent;
+
+    #[test]
+    fn model_with_value_restarts_claude_agent() {
+        assert!(should_restart_agent("model", "claude-5", true));
+        assert!(should_restart_agent("mode", "plan", true));
+    }
+
+    #[test]
+    fn model_query_does_not_restart() {
+        // Bare `/model` just reports the current model.
+        assert!(!should_restart_agent("model", "", true));
+        // `/mode` with an invalid value is rejected by cmd_mode — no change.
+        assert!(!should_restart_agent("mode", "bogus", true));
+        assert!(!should_restart_agent("mode", "", true));
+    }
+
+    #[test]
+    fn model_switch_leaves_non_claude_backends_running() {
+        assert!(!should_restart_agent("model", "claude-5", false));
+        assert!(!should_restart_agent("mode", "plan", false));
+    }
+
+    #[test]
+    fn session_commands_always_restart() {
+        for cmd in ["new", "switch", "delete", "dir", "cd", "attach", "resume"] {
+            assert!(should_restart_agent(cmd, "", true));
+            assert!(should_restart_agent(cmd, "", false));
+        }
+    }
+
+    #[test]
+    fn other_commands_do_not_restart() {
+        for cmd in ["status", "list", "help", "history", "current"] {
+            assert!(!should_restart_agent(cmd, "", true));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
